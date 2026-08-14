@@ -26,6 +26,17 @@ docker compose config --quiet
 
 Application tests start isolated PostgreSQL containers and therefore require a working Docker daemon.
 
+For host-based development, start only PostgreSQL, apply migrations, then run the web and worker processes in separate terminals:
+
+```sh
+docker compose up --detach database
+pnpm db:migrate
+pnpm dev
+pnpm worker
+```
+
+The Compose database port binds to `127.0.0.1` only. `DATABASE_URL` in `.env` must use the same password and `POSTGRES_PORT` values as the database service.
+
 ## Architecture
 
 - Next.js serves the web application and HTTP routes.

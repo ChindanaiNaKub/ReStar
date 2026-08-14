@@ -1,24 +1,19 @@
-import { PostgreSqlContainer } from "@testcontainers/postgresql";
-import type { StartedPostgreSqlContainer } from "@testcontainers/postgresql";
-import { afterAll, beforeAll, expect, it, vi } from "vitest";
+import { afterAll, beforeAll, expect, it } from "vitest";
 
-let postgres: StartedPostgreSqlContainer;
+import { startTestApplication } from "./support/test-application";
+
+let application: Awaited<ReturnType<typeof startTestApplication>>;
 
 beforeAll(async () => {
-  postgres = await new PostgreSqlContainer("postgres:16-alpine").start();
-  process.env.DATABASE_URL = postgres.getConnectionUri();
+  application = await startTestApplication();
 });
 
 afterAll(async () => {
-  await postgres.stop();
-  delete process.env.DATABASE_URL;
+  await application.stop();
 });
 
 it("reports that the application and database are healthy", async () => {
-  vi.resetModules();
-  const { GET } = await import("../src/app/api/health/route");
-
-  const response = await GET();
+  const response = await application.request("/api/health");
 
   expect(response.status).toBe(200);
   await expect(response.json()).resolves.toEqual({
