@@ -77,6 +77,7 @@ export async function startTestApplication(options: TestApplicationOptions = {})
       const response = await fetch(`${baseUrl}/api/health`);
       if (response.ok) {
         return {
+          databaseUrl,
           request: (pathname: string, init?: RequestInit) => fetch(`${baseUrl}${pathname}`, init),
           async stop() {
             server.kill("SIGTERM");

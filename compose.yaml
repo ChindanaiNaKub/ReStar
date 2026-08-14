@@ -3,6 +3,12 @@ name: restar
 x-database-environment: &database-environment
   DATABASE_URL: postgres://restar:${POSTGRES_PASSWORD:-change-me}@database:5432/restar
 
+x-application-environment: &application-environment
+  DATABASE_URL: postgres://restar:${POSTGRES_PASSWORD:-change-me}@database:5432/restar
+  GITHUB_CLIENT_ID: ${GITHUB_CLIENT_ID:-}
+  GITHUB_CLIENT_SECRET: ${GITHUB_CLIENT_SECRET:-}
+  GITHUB_TOKEN_ENCRYPTION_KEY: ${GITHUB_TOKEN_ENCRYPTION_KEY:-}
+
 services:
   database:
     image: postgres:16-alpine
@@ -35,7 +41,7 @@ services:
     build:
       context: .
       target: runtime
-    environment: *database-environment
+    environment: *application-environment
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -45,7 +51,7 @@ services:
     build:
       context: .
       target: worker
-    environment: *database-environment
+    environment: *application-environment
     depends_on:
       migrate:
         condition: service_completed_successfully

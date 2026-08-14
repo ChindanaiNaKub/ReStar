@@ -8,6 +8,7 @@ export default function Home() {
           ReStar brings a few forgotten repositories back each week, then learns when you want to
           see them again.
         </p>
+        <a className="primary-action" href="/api/auth/github/start">Sign in with GitHub</a>
         <div className="status">
           <span className="status-dot" aria-hidden="true" />
           Self-hosted foundation is running

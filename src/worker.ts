@@ -1,4 +1,5 @@
 import { migrateDatabase } from "./db/migrate";
+import { createJobHandlers } from "./jobs/handlers";
 import { runWorkerCycle } from "./jobs/run-worker-cycle";
 
 const databaseUrl = process.env.DATABASE_URL;
@@ -20,7 +21,11 @@ process.once("SIGTERM", () => {
 await migrateDatabase(databaseUrl);
 
 while (!stopping) {
-  const result = await runWorkerCycle({ databaseUrl, now: new Date(), handlers: {} });
+  const result = await runWorkerCycle({
+    databaseUrl,
+    now: new Date(),
+    handlers: createJobHandlers({ databaseUrl }),
+  });
 
   if (result.claimed > 0) {
     console.info(JSON.stringify({ event: "worker.cycle", ...result }));

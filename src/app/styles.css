@@ -37,3 +37,15 @@ h1 { max-width: 14ch; margin: 0; font-size: clamp(2.5rem, 8vw, 5rem); line-heigh
 .lede { max-width: 39rem; margin: 1.75rem 0 2.5rem; color: var(--muted); font-size: clamp(1rem, 2.5vw, 1.25rem); line-height: 1.65; }
 .status { display: inline-flex; align-items: center; gap: 0.65rem; color: var(--muted); font-size: 0.9rem; }
 .status-dot { width: 0.7rem; height: 0.7rem; border-radius: 999px; background: var(--accent); box-shadow: 0 0 1rem rgb(126 231 135 / 60%); }
+.primary-action {
+  display: inline-block;
+  margin: 0 0 2rem;
+  border-radius: 0.75rem;
+  background: var(--accent);
+  color: var(--background);
+  padding: 0.85rem 1.15rem;
+  font-weight: 750;
+  text-decoration: none;
+}
+.primary-action:hover { filter: brightness(1.08); }
+.primary-action:focus-visible { outline: 3px solid var(--text); outline-offset: 3px; }

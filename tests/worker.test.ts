@@ -39,6 +39,6 @@ it("runs a due job through the scheduled worker entrypoint", async () => {
     },
   });
 
-  expect(result).toEqual({ claimed: 1, completed: 1, failed: 0 });
+  expect(result).toEqual({ claimed: 1, completed: 1, failed: 0, retrying: 0 });
   expect(handledPayloads).toEqual([{ requestId: "job-123" }]);
 });

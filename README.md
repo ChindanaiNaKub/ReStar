@@ -8,11 +8,14 @@ Requirements: Node.js 22+, pnpm 11, Docker, and Docker Compose.
 
 ```sh
 cp .env.example .env
+# Fill in the GitHub OAuth credentials and generate GITHUB_TOKEN_ENCRYPTION_KEY.
 pnpm install
 docker compose up --build
 ```
 
 Open `https://localhost`. Caddy uses a local certificate for the default local domain, so the browser may require local trust configuration.
+
+Create a GitHub OAuth App with callback URL `https://<APP_DOMAIN>/api/auth/github/callback`. ReStar requests only `user:email`, never a repository scope. Keep `GITHUB_TOKEN_ENCRYPTION_KEY` stable after Users sign in; changing it makes stored GitHub tokens unreadable.
 
 Run checks directly:
 
