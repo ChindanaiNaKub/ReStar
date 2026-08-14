@@ -9,7 +9,7 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
-  await application.stop();
+  await application?.stop();
 });
 
 it("reports that the application and database are healthy", async () => {
