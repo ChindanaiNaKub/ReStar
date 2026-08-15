@@ -122,6 +122,7 @@ export const jobs = pgTable(
     status: text("status").notNull().default("pending"),
     runAfter: timestamp("run_after", { withTimezone: true }).notNull(),
     lockedAt: timestamp("locked_at", { withTimezone: true }),
+    lockedBy: text("locked_by"),
     attempts: integer("attempts").notNull().default(0),
     maxAttempts: integer("max_attempts").notNull().default(3),
     lastError: text("last_error"),

@@ -1,6 +1,11 @@
 import postgres from "postgres";
+import { randomUUID } from "node:crypto";
 
-export type JobContext = { attempt: number; maxAttempts: number };
+export type JobContext = {
+  attempt: number;
+  maxAttempts: number;
+  heartbeat: () => Promise<boolean>;
+};
 type JobHandler = (payload: unknown, context: JobContext) => Promise<void>;
 
 type RunWorkerCycleOptions = {
@@ -16,6 +21,7 @@ type ClaimedJob = {
   payload: unknown;
   attempts: number;
   max_attempts: number;
+  locked_by: string;
 };
 
 type RetryableFailure = Error & { retryable?: boolean; retryAfterMs?: number };
@@ -27,6 +33,7 @@ export async function runWorkerCycle({
   batchSize = 10,
 }: RunWorkerCycleOptions) {
   const client = postgres(databaseUrl, { max: 1 });
+  const workerToken = randomUUID();
 
   try {
     const claimed = await client.begin(async (transaction) => {
@@ -41,10 +48,10 @@ export async function runWorkerCycle({
           limit ${batchSize}
         )
         update jobs
-        set status = 'running', locked_at = ${now}, attempts = attempts + 1
+        set status = 'running', locked_at = ${now}, locked_by = ${workerToken}, attempts = attempts + 1
         from due_jobs
         where jobs.id = due_jobs.id
-        returning jobs.id, jobs.kind, jobs.payload, jobs.attempts, jobs.max_attempts
+        returning jobs.id, jobs.kind, jobs.payload, jobs.attempts, jobs.max_attempts, jobs.locked_by
       `;
     });
 
@@ -54,39 +61,63 @@ export async function runWorkerCycle({
 
     for (const job of claimed) {
       const handler = handlers[job.kind];
+      const heartbeat = async () => {
+        const refreshed = await client<{ id: number }[]>`
+          update jobs set locked_at = ${new Date()}
+          where id = ${job.id} and status = 'running' and locked_by = ${job.locked_by}
+          returning id
+        `;
+        return refreshed.length === 1;
+      };
+      const heartbeatTimer = setInterval(() => {
+        void heartbeat().catch((error: unknown) => {
+          console.error(JSON.stringify({
+            event: "worker.heartbeat_failed",
+            jobId: job.id,
+            errorName: error instanceof Error ? error.name : "UnknownFailure",
+          }));
+        });
+      }, 60_000);
+      heartbeatTimer.unref();
 
       try {
         if (!handler) {
           throw new Error(`No handler registered for job kind: ${job.kind}`);
         }
 
-        await handler(job.payload, { attempt: job.attempts, maxAttempts: job.max_attempts });
-        await client`
+        await handler(job.payload, { attempt: job.attempts, maxAttempts: job.max_attempts, heartbeat });
+        const updated = await client<{ id: number }[]>`
           update jobs
-          set status = 'completed', completed_at = ${now}, locked_at = null
-          where id = ${job.id}
+          set status = 'completed', completed_at = ${now}, locked_at = null, locked_by = null
+          where id = ${job.id} and locked_by = ${job.locked_by}
+          returning id
         `;
-        completed += 1;
+        completed += updated.length;
       } catch (error) {
         const message = error instanceof Error ? error.message : "Unknown job failure";
         const retryable = error as RetryableFailure;
         if (retryable.retryable && job.attempts < job.max_attempts) {
           const requestedDelay = retryable.retryAfterMs ?? 60_000 * 2 ** (job.attempts - 1);
           const delayMs = Math.min(Math.max(requestedDelay, 1_000), 15 * 60_000);
-          await client`
+          const updated = await client<{ id: number }[]>`
             update jobs
-            set status = 'pending', last_error = ${message}, locked_at = null, run_after = ${new Date(now.getTime() + delayMs)}
-            where id = ${job.id}
+            set status = 'pending', last_error = ${message}, locked_at = null, locked_by = null,
+              run_after = ${new Date(now.getTime() + delayMs)}
+            where id = ${job.id} and locked_by = ${job.locked_by}
+            returning id
           `;
-          retrying += 1;
+          retrying += updated.length;
         } else {
-          await client`
+          const updated = await client<{ id: number }[]>`
             update jobs
-            set status = 'failed', last_error = ${message}, locked_at = null
-            where id = ${job.id}
+            set status = 'failed', last_error = ${message}, locked_at = null, locked_by = null
+            where id = ${job.id} and locked_by = ${job.locked_by}
+            returning id
           `;
-          failed += 1;
+          failed += updated.length;
         }
+      } finally {
+        clearInterval(heartbeatTimer);
       }
     }
 

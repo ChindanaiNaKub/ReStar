@@ -1,81 +1,13 @@
 import postgres from "postgres";
 
 import { decryptAccessToken } from "@/auth/crypto";
+import { fetchStarredPage, GitHubImportFailure } from "@/github/starred-repositories";
 import { logEvent } from "@/observability/log";
 import type { JobContext } from "./run-worker-cycle";
 
 type ImportPayload = { importId: number; userId: number };
 
-type StarredRepositoryResponse = {
-  starred_at: string;
-  repo: {
-    id: number;
-    name: string;
-    full_name: string;
-    private: boolean;
-    html_url: string;
-    description: string | null;
-    language: string | null;
-    stargazers_count: number;
-    owner: { login: string };
-  };
-};
-
-class GitHubImportFailure extends Error {
-  constructor(
-    message: string,
-    readonly kind: "revoked" | "rate_limit" | "other",
-    readonly retryable: boolean,
-    readonly retryAfterMs?: number,
-  ) {
-    super(message);
-  }
-}
-
-function nextPageUrl(link: string | null, apiOrigin: string) {
-  if (!link) return null;
-  for (const part of link.split(",")) {
-    const match = part.match(/<([^>]+)>;\s*rel="([^"]+)"/);
-    if (match?.[2] !== "next") continue;
-    const next = new URL(match[1]!);
-    if (next.origin !== apiOrigin) throw new GitHubImportFailure("GitHub returned an unsafe pagination link", "other", false);
-    return next;
-  }
-  return null;
-}
-
-async function fetchStarredPage(url: URL, accessToken: string, apiOrigin: string) {
-  const response = await fetch(url, {
-    headers: {
-      accept: "application/vnd.github.star+json",
-      authorization: `Bearer ${accessToken}`,
-      "x-github-api-version": "2022-11-28",
-    },
-  });
-  if (!response.ok) {
-    if (response.status === 401) {
-      throw new GitHubImportFailure("GitHub access was revoked; sign in again", "revoked", false);
-    }
-    if (response.status === 429 || response.status === 403) {
-      const retryAfterHeader = response.headers.get("retry-after");
-      const retryAfterSeconds = retryAfterHeader === null ? Number.NaN : Number(retryAfterHeader);
-      throw new GitHubImportFailure(
-        "GitHub rate limit reached; import will retry",
-        "rate_limit",
-        true,
-        Number.isFinite(retryAfterSeconds) ? retryAfterSeconds * 1000 : undefined,
-      );
-    }
-    throw new GitHubImportFailure(
-      `GitHub Stars request failed (${response.status})`,
-      "other",
-      response.status >= 500,
-    );
-  }
-  const body = (await response.json()) as StarredRepositoryResponse[];
-  if (!Array.isArray(body)) throw new GitHubImportFailure("GitHub returned an invalid Stars page", "other", false);
-  return { stars: body, next: nextPageUrl(response.headers.get("link"), apiOrigin) };
-}
+class JobLeaseLostFailure extends Error {}
 
 function importPayload(payload: unknown): ImportPayload {
   if (typeof payload !== "object" || payload === null) {
@@ -101,6 +33,7 @@ export function createJobHandlers(options: CreateJobHandlersOptions) {
       const payload = importPayload(rawPayload);
       const client = postgres(options.databaseUrl, { max: 1 });
       try {
+        if (!(await context.heartbeat())) throw new JobLeaseLostFailure("GitHub import job lease was lost");
         logEvent("github_import.started", {
           importId: payload.importId,
           userId: payload.userId,
@@ -114,6 +47,8 @@ export function createJobHandlers(options: CreateJobHandlersOptions) {
         const accessToken = decryptAccessToken(encryptedToken, options.tokenEncryptionKey);
         const apiBase = new URL(options.githubApiBaseUrl ?? process.env.GITHUB_API_BASE_URL ?? "https://api.github.com");
         let pageUrl: URL | null = new URL("/user/starred?per_page=100&page=1", apiBase);
+        let pagesCompleted = 0;
+        let importedRepositories = 0;
 
         await client`
           update imports set status = 'running', error = null,
@@ -123,7 +58,10 @@ export function createJobHandlers(options: CreateJobHandlersOptions) {
 
         while (pageUrl) {
           const page = await fetchStarredPage(pageUrl, accessToken, apiBase.origin);
+          if (!(await context.heartbeat())) throw new JobLeaseLostFailure("GitHub import job lease was lost");
           const publicStars = page.stars.filter((star) => star.repo.private === false);
+          pagesCompleted += 1;
+          importedRepositories += publicStars.length;
           await client.begin(async (transaction) => {
             for (const star of publicStars) {
               const starredAt = new Date(star.starred_at);
@@ -158,8 +96,8 @@ export function createJobHandlers(options: CreateJobHandlersOptions) {
             }
             await transaction`
               update imports set
-                pages_completed = pages_completed + 1,
-                imported_repositories = imported_repositories + ${publicStars.length},
+                pages_completed = ${pagesCompleted},
+                imported_repositories = ${importedRepositories},
                 updated_at = now()
               where id = ${payload.importId} and user_id = ${payload.userId}
             `;
@@ -171,12 +109,17 @@ export function createJobHandlers(options: CreateJobHandlersOptions) {
           pageUrl = page.next;
         }
 
+        if (!(await context.heartbeat())) throw new JobLeaseLostFailure("GitHub import job lease was lost");
         await client`
           update imports set status = 'completed', error = null, completed_at = now(), updated_at = now()
           where id = ${payload.importId} and user_id = ${payload.userId}
         `;
         logEvent("github_import.completed", { importId: payload.importId, userId: payload.userId });
       } catch (error) {
+        if (error instanceof JobLeaseLostFailure || !(await context.heartbeat().catch(() => false))) {
+          logEvent("github_import.lease_lost", { importId: payload.importId, userId: payload.userId });
+          throw error;
+        }
         const failure = error instanceof GitHubImportFailure
           ? error
           : new GitHubImportFailure(error instanceof Error ? error.message : "Import failed", "other", true);

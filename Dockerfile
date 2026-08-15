@@ -1,5 +1,9 @@
-FROM node:22-alpine AS dependencies
-RUN npm install --global pnpm@11.1.0
+FROM node:22-alpine AS pnpm
+WORKDIR /tooling
+COPY package.json ./
+RUN npm install --global "$(node -p "require('./package.json').packageManager")"
+
+FROM pnpm AS dependencies
 WORKDIR /app
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 RUN pnpm install --frozen-lockfile
@@ -8,10 +12,9 @@ FROM dependencies AS build
 COPY . .
 RUN pnpm build
 
-FROM node:22-alpine AS runtime
+FROM pnpm AS runtime
 ENV NODE_ENV=production
 WORKDIR /app
-RUN npm install --global pnpm@11.1.0
 RUN addgroup --system --gid 1001 nodejs && adduser --system --uid 1001 nextjs
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 RUN pnpm install --prod --frozen-lockfile

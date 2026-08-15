@@ -269,6 +269,30 @@ it("shows rate-limit retry state without blocking the request", async () => {
   });
 });
 
+it("does not mislabel a permanent GitHub forbidden response as a rate limit", async () => {
+  const { application, github, sessionCookie } = await startAuthenticatedApplication({
+    starsFailure: { status: 403 },
+  });
+  const { createJobHandlers } = await import("../src/jobs/handlers");
+  const { runWorkerCycle } = await import("../src/jobs/run-worker-cycle");
+  const result = await runWorkerCycle({
+    databaseUrl: application.databaseUrl,
+    handlers: createJobHandlers({
+      databaseUrl: application.databaseUrl,
+      githubApiBaseUrl: github.baseUrl,
+      tokenEncryptionKey: encryptionKey,
+    }),
+    now: new Date(),
+  });
+  expect(result).toEqual({ claimed: 1, completed: 0, failed: 1, retrying: 0 });
+
+  const status = await application.request("/api/import/status", { headers: { cookie: sessionCookie } });
+  await expect(status.json()).resolves.toMatchObject({
+    error: "GitHub Stars request failed (403)",
+    status: "failed",
+  });
+});
+
 it("shows revoked GitHub access as a terminal import failure", async () => {
   const { application, github, sessionCookie } = await startAuthenticatedApplication({
     starsFailure: { status: 401 },

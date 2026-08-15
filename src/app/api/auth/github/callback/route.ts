@@ -11,7 +11,10 @@ const oauthCookieName = "restar_oauth";
 
 export async function GET(request: Request) {
   const databaseUrl = process.env.DATABASE_URL;
-  if (!databaseUrl) throw new Error("DATABASE_URL is required");
+  if (!databaseUrl) {
+    logEvent("oauth.callback.failed", { errorName: "MissingDatabaseConfiguration" });
+    throw new Error("DATABASE_URL is required");
+  }
 
   const url = new URL(request.url);
   const state = url.searchParams.get("state");
@@ -99,7 +102,7 @@ export async function GET(request: Request) {
             now()
           )
           on conflict (idempotency_key) do update set
-            payload = excluded.payload, status = 'pending', run_after = now(), locked_at = null,
+            payload = excluded.payload, status = 'pending', run_after = now(), locked_at = null, locked_by = null,
             attempts = 0, last_error = null, completed_at = null
         `;
       }
@@ -116,6 +119,11 @@ export async function GET(request: Request) {
     response.cookies.set(oauthCookieName, "", { maxAge: 0, path: "/api/auth/github/callback" });
     logEvent("oauth.callback.succeeded", { githubUserId: String(identity.id) });
     return response;
+  } catch (error) {
+    logEvent("oauth.callback.failed", {
+      errorName: error instanceof Error ? error.name : "UnknownFailure",
+    });
+    throw error;
   } finally {
     await client.end();
   }

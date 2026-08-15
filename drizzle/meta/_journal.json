@@ -22,6 +22,13 @@
       "when": 1786770630121,
       "tag": "0002_loud_punisher",
       "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1786771322491,
+      "tag": "0003_magical_doctor_doom",
+      "breakpoints": true
     }
   ]
 }
