@@ -1,24 +1,44 @@
 # ReStar
 
-ReStar turns GitHub Stars from passive bookmarks into an active memory system. It is an early, self-hostable MVP under active development.
+ReStar turns GitHub Stars from passive bookmarks into an active memory system.
+It is a self-hostable MVP: Next.js, PostgreSQL, a scheduled worker, and Caddy
+run as one Docker Compose deployment.
 
-## Development
+## Quick start
 
 Requirements: Node.js 22+, pnpm 11, Docker, and Docker Compose.
 
 ```sh
 cp .env.example .env
-# Fill in the GitHub OAuth credentials, generate GITHUB_TOKEN_ENCRYPTION_KEY, and set
-# EMAIL_ACTION_TOKEN_SECRET to a separate random secret.
+openssl rand -base64 32 # put one value in GITHUB_TOKEN_ENCRYPTION_KEY
+openssl rand -base64 32 # put a different value in EMAIL_ACTION_TOKEN_SECRET
 pnpm install
 docker compose up --build
 ```
 
-Open `https://localhost`. Caddy uses a local certificate for the default local domain, so the browser may require local trust configuration.
+Create a GitHub OAuth App with callback URL
+`https://<APP_DOMAIN>/api/auth/github/callback`. ReStar requests only
+`user:email` and imports public Stars; it never requests private repository
+access. Configure either Resend or standard SMTP in `.env` before using
+Digest delivery. Open `APP_URL` after the stack is healthy.
 
-Create a GitHub OAuth App with callback URL `https://<APP_DOMAIN>/api/auth/github/callback`. ReStar requests only `user:email`, never a repository scope. Keep `GITHUB_TOKEN_ENCRYPTION_KEY` stable after Users sign in; changing it makes stored GitHub tokens unreadable.
+The complete deployment, migration, HTTPS, backup, and smoke-test procedure is
+in [docs/OPERATIONS.md](docs/OPERATIONS.md). Data handling, account deletion,
+and the security boundary are in [docs/SECURITY.md](docs/SECURITY.md).
 
-Run checks directly:
+## Development
+
+For host-based development, start PostgreSQL, migrate, then run the web and
+worker in separate terminals:
+
+```sh
+docker compose up --detach database
+pnpm db:migrate
+pnpm dev
+pnpm worker
+```
+
+Run the checks used by CI and releases:
 
 ```sh
 pnpm typecheck
@@ -28,24 +48,9 @@ pnpm build
 docker compose config --quiet
 ```
 
-Application tests start isolated PostgreSQL containers and therefore require a working Docker daemon.
+Tests use disposable PostgreSQL containers and require a working Docker daemon.
+Contributor workflow is documented in [CONTRIBUTING.md](CONTRIBUTING.md).
 
-For host-based development, start only PostgreSQL, apply migrations, then run the web and worker processes in separate terminals:
+## License
 
-```sh
-docker compose up --detach database
-pnpm db:migrate
-pnpm dev
-pnpm worker
-```
-
-The Compose database port binds to `127.0.0.1` only. `DATABASE_URL` in `.env` must use the same password and `POSTGRES_PORT` values as the database service.
-
-## Architecture
-
-- Next.js serves the web application and HTTP routes.
-- PostgreSQL stores durable application and job state.
-- A worker built from the same source image claims scheduled jobs from PostgreSQL.
-- Caddy terminates HTTPS and proxies to the application.
-
-See [the MVP spec](docs/specs/restar-mvp.md), [domain language](CONTEXT.md), and [architectural decisions](docs/adr/).
+ReStar is available under the [MIT License](LICENSE).

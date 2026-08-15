@@ -107,3 +107,38 @@ it("does not let a worker overwrite a job after losing its lease", async () => {
   await inspect.end();
   expect(jobs).toEqual([{ status: "running", locked_by: "replacement-worker" }]);
 });
+
+it("stores a redacted diagnostic when a job fails", async () => {
+  const databaseUrl = postgresContainer.getConnectionUri();
+  const { migrateDatabase } = await import("../src/db/migrate");
+  await migrateDatabase(databaseUrl);
+
+  const seed = postgres(databaseUrl);
+  await seed`
+    insert into jobs (kind, payload, run_after)
+    values ('probe', ${seed.json({ requestId: "secret-job" })}, ${new Date("2026-08-14T00:00:00Z")})
+  `;
+  await seed.end();
+
+  const { runWorkerCycle } = await import("../src/jobs/run-worker-cycle");
+  const result = await runWorkerCycle({
+    databaseUrl,
+    now: new Date("2026-08-14T00:00:01Z"),
+    handlers: {
+      probe: async () => {
+        throw new Error("GitHub rejected Bearer secret-token for person@example.com");
+      },
+    },
+  });
+
+  expect(result).toEqual({ claimed: 1, completed: 0, failed: 1, retrying: 0 });
+  const inspect = postgres(databaseUrl);
+  const jobs = await inspect<{ status: string; last_error: string }[]>`
+    select status, last_error from jobs where payload->>'requestId' = 'secret-job'
+  `;
+  expect(jobs).toEqual([{
+    status: "failed",
+    last_error: "GitHub rejected Authorization [REDACTED] for [REDACTED_EMAIL]",
+  }]);
+  await inspect.end();
+});

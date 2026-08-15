@@ -2,6 +2,7 @@ import postgres from "postgres";
 import { randomUUID } from "node:crypto";
 
 import { enqueueDueDigests } from "@/digest/service";
+import { logEvent, safeErrorMessage } from "@/observability/log";
 
 export type JobContext = {
   attempt: number;
@@ -78,11 +79,10 @@ export async function runWorkerCycle({
       };
       const heartbeatTimer = setInterval(() => {
         void heartbeat().catch((error: unknown) => {
-          console.error(JSON.stringify({
-            event: "worker.heartbeat_failed",
+          logEvent("worker.heartbeat_failed", {
             jobId: job.id,
             errorName: error instanceof Error ? error.name : "UnknownFailure",
-          }));
+          });
         });
       }, 60_000);
       heartbeatTimer.unref();
@@ -107,7 +107,7 @@ export async function runWorkerCycle({
         `;
         completed += updated.length;
       } catch (error) {
-        const message = error instanceof Error ? error.message : "Unknown job failure";
+        const message = safeErrorMessage(error, "Unknown job failure");
         const retryable = error as RetryableFailure;
         if (retryable.retryable && job.attempts < job.max_attempts) {
           const requestedDelay = retryable.retryAfterMs ?? 60_000 * 2 ** (job.attempts - 1);

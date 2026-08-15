@@ -1,6 +1,7 @@
 import type postgres from "postgres";
 
 import { applicationUrl, emailActionUrl, ensureEmailActionToken, feedbackActionLabels } from "@/email/actions";
+import { safeErrorMessage } from "@/observability/log";
 import { feedbackActions, type FeedbackAction } from "@/rotation/service";
 import { getMostRecentDigestDelivery } from "./schedule";
 
@@ -104,6 +105,11 @@ export async function enqueueDueDigests(client: ReturnType<typeof postgres>, now
     `;
     let enqueued = 0;
     for (const schedule of schedules) {
+      await transaction`select pg_advisory_xact_lock(${schedule.user_id})`;
+      const currentUser = await transaction<{ id: number }[]>`
+        select id from users where id = ${schedule.user_id}
+      `;
+      if (currentUser.length === 0) continue;
       const scheduledFor = getMostRecentDigestDelivery({
         dayOfWeek: schedule.day_of_week,
         hour: schedule.hour,
@@ -419,7 +425,7 @@ export async function markDigestSent(client: ReturnType<typeof postgres>, digest
 
 export async function markDigestFailed(client: ReturnType<typeof postgres>, digestId: number, message: string) {
   await client`
-    update digests set status = 'failed', last_error = ${message}, updated_at = now()
+    update digests set status = 'failed', last_error = ${safeErrorMessage(message)}, updated_at = now()
     where id = ${digestId} and status <> 'sent'
   `;
 }

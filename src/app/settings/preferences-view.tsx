@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { useRouter } from "next/navigation";
 
 type DigestPreferences = {
   dayOfWeek: number;
@@ -28,9 +29,12 @@ function formatNextDelivery(preferences: DigestPreferences) {
 }
 
 export default function DigestPreferencesView() {
+  const router = useRouter();
   const [preferences, setPreferences] = useState<DigestPreferences | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
+  const [deleteConfirmation, setDeleteConfirmation] = useState("");
+  const [deleting, setDeleting] = useState(false);
 
   useEffect(() => {
     void fetch("/api/digest/preferences", { headers: { "x-time-zone": detectedTimezone() } })
@@ -58,6 +62,24 @@ export default function DigestPreferencesView() {
       setError(saveError instanceof Error ? saveError.message : "Digest settings could not be saved.");
     } finally {
       setSaving(false);
+    }
+  }
+
+  async function deleteAccount() {
+    setDeleting(true);
+    setError(null);
+    try {
+      const response = await fetch("/api/account", {
+        method: "DELETE",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ confirmation: deleteConfirmation }),
+      });
+      const body = await response.json() as { error?: string };
+      if (!response.ok) throw new Error(body.error ?? "Account could not be deleted.");
+      router.push("/");
+    } catch (deleteError) {
+      setError(deleteError instanceof Error ? deleteError.message : "Account could not be deleted.");
+      setDeleting(false);
     }
   }
 
@@ -101,6 +123,28 @@ export default function DigestPreferencesView() {
         </label>
         <button className="primary-action" disabled={saving} type="submit">{saving ? "Saving…" : "Save Digest settings"}</button>
       </form>
+      <section className="danger-zone" aria-labelledby="delete-account-heading">
+        <p className="eyebrow">Leave ReStar</p>
+        <h2 id="delete-account-heading">Delete your account</h2>
+        <p>This permanently removes your GitHub token, settings, Digest history, Feedback history, and Starred Repository associations.</p>
+        <label>
+          Type DELETE to confirm
+          <input
+            value={deleteConfirmation}
+            onChange={(event) => setDeleteConfirmation(event.target.value)}
+            autoComplete="off"
+            spellCheck={false}
+          />
+        </label>
+        <button
+          className="danger-action"
+          disabled={deleting || deleteConfirmation !== "DELETE"}
+          type="button"
+          onClick={() => void deleteAccount()}
+        >
+          {deleting ? "Deleting account…" : "Delete account permanently"}
+        </button>
+      </section>
     </div>
   );
 }

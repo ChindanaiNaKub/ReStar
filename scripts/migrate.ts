@@ -1,4 +1,5 @@
 import { migrateDatabase } from "../src/db/migrate";
+import { logEvent } from "../src/observability/log";
 
 const databaseUrl = process.env.DATABASE_URL;
 
@@ -7,4 +8,4 @@ if (!databaseUrl) {
 }
 
 await migrateDatabase(databaseUrl);
-console.info("Database migrations are up to date.");
+logEvent("database.migrations_completed", {});

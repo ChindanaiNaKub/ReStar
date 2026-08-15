@@ -1,6 +1,7 @@
 import { migrateDatabase } from "./db/migrate";
 import { createJobHandlers } from "./jobs/handlers";
 import { runWorkerCycle } from "./jobs/run-worker-cycle";
+import { logEvent } from "./observability/log";
 
 const databaseUrl = process.env.DATABASE_URL;
 const intervalMs = 15_000;
@@ -27,9 +28,7 @@ while (!stopping) {
     handlers: createJobHandlers({ databaseUrl }),
   });
 
-  if (result.claimed > 0) {
-    console.info(JSON.stringify({ event: "worker.cycle", ...result }));
-  }
+  logEvent("worker.cycle", result);
 
   await new Promise((resolve) => setTimeout(resolve, intervalMs));
 }

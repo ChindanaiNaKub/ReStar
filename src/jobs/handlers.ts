@@ -16,7 +16,7 @@ import {
 import { applicationUrl } from "@/email/actions";
 import { createEmailProvider, EmailDeliveryFailure, type EmailProvider } from "@/email/provider";
 import { fetchStarredPage, GitHubImportFailure } from "@/github/starred-repositories";
-import { logEvent } from "@/observability/log";
+import { logEvent, safeErrorMessage } from "@/observability/log";
 import type { JobContext } from "./run-worker-cycle";
 
 type ImportPayload = { importId: number; userId: number; digestId?: number };
@@ -54,6 +54,7 @@ export function createJobHandlers(options: CreateJobHandlersOptions) {
       const payload = importPayload(rawPayload);
       const client = postgres(options.databaseUrl, { max: 1 });
       try {
+        await client`select pg_advisory_lock(${payload.userId})`;
         if (!(await context.heartbeat())) throw new JobLeaseLostFailure("GitHub import job lease was lost");
         logEvent("github_import.started", {
           importId: payload.importId,
@@ -237,7 +238,8 @@ export function createJobHandlers(options: CreateJobHandlersOptions) {
         }
         const failure = error instanceof GitHubImportFailure
           ? error
-          : new GitHubImportFailure(error instanceof Error ? error.message : "Import failed", "other", true);
+          : new GitHubImportFailure(safeErrorMessage(error, "Import failed"), "other", true);
+        const failureMessage = safeErrorMessage(failure);
         const willRetry = failure.retryable && context.attempt < context.maxAttempts;
         const finalStatus = failure.kind === "revoked"
           ? "failed_revoked"
@@ -245,7 +247,7 @@ export function createJobHandlers(options: CreateJobHandlersOptions) {
             ? "failed_rate_limit"
             : "failed";
         const failed = await client<{ id: number }[]>`
-          update imports set status = ${willRetry ? "retrying" : finalStatus}, error = ${failure.message}, updated_at = now()
+          update imports set status = ${willRetry ? "retrying" : finalStatus}, error = ${failureMessage}, updated_at = now()
           where id = ${payload.importId} and user_id = ${payload.userId}
             and exists (
               select 1 from jobs
@@ -259,7 +261,7 @@ export function createJobHandlers(options: CreateJobHandlersOptions) {
           throw new JobLeaseLostFailure("GitHub import job lease was lost");
         }
         if (payload.digestId !== undefined) {
-          await markDigestFailed(client, payload.digestId, failure.message);
+          await markDigestFailed(client, payload.digestId, failureMessage);
         }
         logEvent("github_import.failed", {
           importId: payload.importId,
@@ -269,6 +271,7 @@ export function createJobHandlers(options: CreateJobHandlersOptions) {
         });
         throw failure;
       } finally {
+        await client`select pg_advisory_unlock(${payload.userId})`.catch(() => undefined);
         await client.end();
       }
     },
@@ -276,6 +279,7 @@ export function createJobHandlers(options: CreateJobHandlersOptions) {
       const payload = parseDigestPayload(rawPayload);
       const client = postgres(options.databaseUrl, { max: 1 });
       try {
+        await client`select pg_advisory_lock(${payload.userId})`;
         if (!(await context.heartbeat())) throw new JobLeaseLostFailure("Digest preparation job lease was lost");
         const digestId = await createDigest(client, payload);
         const existing = await client<{ status: string }[]>`
@@ -304,6 +308,7 @@ export function createJobHandlers(options: CreateJobHandlersOptions) {
           `;
         }
       } finally {
+        await client`select pg_advisory_unlock(${payload.userId})`.catch(() => undefined);
         await client.end();
       }
     },
@@ -311,6 +316,7 @@ export function createJobHandlers(options: CreateJobHandlersOptions) {
       const payload = parseDigestDeliveryPayload(rawPayload);
       const client = postgres(options.databaseUrl, { max: 1 });
       try {
+        await client`select pg_advisory_lock(${payload.userId})`;
         let digest;
         try {
           digest = await claimDigestForDelivery(client, payload.digestId, payload.userId, new Date(), {
@@ -318,8 +324,9 @@ export function createJobHandlers(options: CreateJobHandlersOptions) {
             actionBaseUrl: options.emailActionBaseUrl,
           });
         } catch (error) {
-          await markDigestFailed(client, payload.digestId, error instanceof Error ? error.message : "Digest delivery failed");
-          throw new EmailDeliveryFailure(error instanceof Error ? error.message : "Digest delivery failed", false);
+          const failureMessage = safeErrorMessage(error, "Digest delivery failed");
+          await markDigestFailed(client, payload.digestId, failureMessage);
+          throw new EmailDeliveryFailure(failureMessage, false);
         }
         if (!digest) return;
         if (!(await context.heartbeat())) throw new JobLeaseLostFailure("Digest delivery job lease was lost");
@@ -346,11 +353,12 @@ export function createJobHandlers(options: CreateJobHandlersOptions) {
           if (error instanceof JobLeaseLostFailure) throw error;
           const failure = error instanceof EmailDeliveryFailure
             ? error
-            : new EmailDeliveryFailure(error instanceof Error ? error.message : "Email delivery failed", true);
-          await markDigestFailed(client, digest.digestId, failure.message);
+            : new EmailDeliveryFailure(safeErrorMessage(error, "Email delivery failed"), true);
+          await markDigestFailed(client, digest.digestId, safeErrorMessage(failure));
           throw failure;
         }
       } finally {
+        await client`select pg_advisory_unlock(${payload.userId})`.catch(() => undefined);
         await client.end();
       }
     },
@@ -358,6 +366,7 @@ export function createJobHandlers(options: CreateJobHandlersOptions) {
       const payload = parsePauseNoticePayload(rawPayload);
       const client = postgres(options.databaseUrl, { max: 1 });
       try {
+        await client`select pg_advisory_lock(${payload.userId})`;
         const users = await client<{ email: string | null; paused: boolean; pause_generation: number; pause_notice_sent_at: Date | null }[]>`
           select users.email, digest_preferences.paused, digest_preferences.pause_generation,
             digest_preferences.pause_notice_sent_at
@@ -394,10 +403,11 @@ export function createJobHandlers(options: CreateJobHandlersOptions) {
           if (error instanceof JobLeaseLostFailure) throw error;
           const failure = error instanceof EmailDeliveryFailure
             ? error
-            : new EmailDeliveryFailure(error instanceof Error ? error.message : "Pause notice delivery failed", true);
+            : new EmailDeliveryFailure(safeErrorMessage(error, "Pause notice delivery failed"), true);
           throw failure;
         }
       } finally {
+        await client`select pg_advisory_unlock(${payload.userId})`.catch(() => undefined);
         await client.end();
       }
     },
