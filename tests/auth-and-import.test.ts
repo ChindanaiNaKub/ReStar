@@ -1,13 +1,15 @@
 import { createServer } from "node:http";
 import { once } from "node:events";
 import type { AddressInfo } from "node:net";
-import { afterEach, expect, it } from "vitest";
+import postgres from "postgres";
+import { afterAll, beforeAll, expect, it } from "vitest";
 
 import { startTestApplication } from "./support/test-application";
 
 const encryptionKey = Buffer.alloc(32, 7).toString("base64");
 
 type FakeGitHubOptions = {
+  githubUserId?: number;
   stars?: Array<Array<Record<string, unknown>>>;
   starsFailure?: { status: number; page?: number; headers?: Record<string, string> };
 };
@@ -32,7 +34,11 @@ async function startFakeGitHub(options: FakeGitHubOptions = {}) {
 
     if (request.url === "/user") {
       response.setHeader("content-type", "application/json");
-      response.end(JSON.stringify({ id: 42, login: "octocat", avatar_url: "https://avatars.example/octocat" }));
+      response.end(JSON.stringify({
+        id: options.githubUserId ?? 42,
+        login: `octocat-${options.githubUserId ?? 42}`,
+        avatar_url: "https://avatars.example/octocat",
+      }));
       return;
     }
 
@@ -75,31 +81,41 @@ async function startFakeGitHub(options: FakeGitHubOptions = {}) {
 type RunningApplication = Awaited<ReturnType<typeof startTestApplication>>;
 type RunningGitHub = Awaited<ReturnType<typeof startFakeGitHub>>;
 
-const applications: RunningApplication[] = [];
-const githubServers: RunningGitHub[] = [];
+const sharedGitHubOptions: FakeGitHubOptions = {};
+let sharedApplication: RunningApplication;
+let sharedGitHub: RunningGitHub;
+let nextGitHubUserId = 100;
 
-afterEach(async () => {
-  await Promise.all(applications.splice(0).map((application) => application.stop()));
-  await Promise.all(githubServers.splice(0).map((github) => github.stop()));
-});
-
-async function startAuthenticatedApplication(options: FakeGitHubOptions = {}) {
-  const github = await startFakeGitHub(options);
-  githubServers.push(github);
-  const application = await startTestApplication({
+beforeAll(async () => {
+  sharedGitHub = await startFakeGitHub(sharedGitHubOptions);
+  sharedApplication = await startTestApplication({
     environment: {
       GITHUB_CLIENT_ID: "client-id",
       GITHUB_CLIENT_SECRET: "client-secret",
-      GITHUB_OAUTH_BASE_URL: github.baseUrl,
-      GITHUB_API_BASE_URL: github.baseUrl,
+      GITHUB_OAUTH_BASE_URL: sharedGitHub.baseUrl,
+      GITHUB_API_BASE_URL: sharedGitHub.baseUrl,
       GITHUB_TOKEN_ENCRYPTION_KEY: encryptionKey,
     },
   });
-  applications.push(application);
+});
 
-  const authentication = await authenticate(application);
+afterAll(async () => {
+  await sharedApplication?.stop();
+  await sharedGitHub?.stop();
+});
 
-  return { application, github, ...authentication };
+async function startAuthenticatedApplication(options: FakeGitHubOptions = {}) {
+  for (const key of Object.keys(sharedGitHubOptions) as Array<keyof FakeGitHubOptions>) {
+    delete sharedGitHubOptions[key];
+  }
+  Object.assign(sharedGitHubOptions, options, { githubUserId: nextGitHubUserId++ });
+  sharedGitHub.requests.length = 0;
+  const cleanup = postgres(sharedApplication.databaseUrl);
+  await cleanup`delete from jobs where status in ('pending', 'running')`;
+  await cleanup.end();
+  const authentication = await authenticate(sharedApplication);
+
+  return { application: sharedApplication, github: sharedGitHub, ...authentication };
 }
 
 async function authenticate(application: RunningApplication) {

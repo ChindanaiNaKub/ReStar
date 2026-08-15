@@ -50,11 +50,18 @@ export function createJobHandlers(options: CreateJobHandlersOptions) {
         let pagesCompleted = 0;
         let importedRepositories = 0;
 
-        await client`
+        const started = await client<{ id: number }[]>`
           update imports set status = 'running', error = null,
             pages_completed = 0, imported_repositories = 0, updated_at = now()
           where id = ${payload.importId} and user_id = ${payload.userId}
+            and exists (
+              select 1 from jobs
+              where jobs.id = ${context.jobId} and jobs.status = 'running'
+                and jobs.locked_by = ${context.leaseToken}
+            )
+          returning id
         `;
+        if (started.length === 0) throw new JobLeaseLostFailure("GitHub import job lease was lost");
 
         while (pageUrl) {
           const page = await fetchStarredPage(pageUrl, accessToken, apiBase.origin);
@@ -94,13 +101,20 @@ export function createJobHandlers(options: CreateJobHandlersOptions) {
                   updated_at = now()
               `;
             }
-            await transaction`
+            const progressed = await transaction<{ id: number }[]>`
               update imports set
                 pages_completed = ${pagesCompleted},
                 imported_repositories = ${importedRepositories},
                 updated_at = now()
               where id = ${payload.importId} and user_id = ${payload.userId}
+                and exists (
+                  select 1 from jobs
+                  where jobs.id = ${context.jobId} and jobs.status = 'running'
+                    and jobs.locked_by = ${context.leaseToken}
+                )
+              returning id
             `;
+            if (progressed.length === 0) throw new JobLeaseLostFailure("GitHub import job lease was lost");
           });
           logEvent("github_import.page_completed", {
             importId: payload.importId,
@@ -110,10 +124,17 @@ export function createJobHandlers(options: CreateJobHandlersOptions) {
         }
 
         if (!(await context.heartbeat())) throw new JobLeaseLostFailure("GitHub import job lease was lost");
-        await client`
+        const completed = await client<{ id: number }[]>`
           update imports set status = 'completed', error = null, completed_at = now(), updated_at = now()
           where id = ${payload.importId} and user_id = ${payload.userId}
+            and exists (
+              select 1 from jobs
+              where jobs.id = ${context.jobId} and jobs.status = 'running'
+                and jobs.locked_by = ${context.leaseToken}
+            )
+          returning id
         `;
+        if (completed.length === 0) throw new JobLeaseLostFailure("GitHub import job lease was lost");
         logEvent("github_import.completed", { importId: payload.importId, userId: payload.userId });
       } catch (error) {
         if (error instanceof JobLeaseLostFailure || !(await context.heartbeat().catch(() => false))) {
@@ -129,10 +150,20 @@ export function createJobHandlers(options: CreateJobHandlersOptions) {
           : failure.kind === "rate_limit"
             ? "failed_rate_limit"
             : "failed";
-        await client`
+        const failed = await client<{ id: number }[]>`
           update imports set status = ${willRetry ? "retrying" : finalStatus}, error = ${failure.message}, updated_at = now()
           where id = ${payload.importId} and user_id = ${payload.userId}
+            and exists (
+              select 1 from jobs
+              where jobs.id = ${context.jobId} and jobs.status = 'running'
+                and jobs.locked_by = ${context.leaseToken}
+            )
+          returning id
         `;
+        if (failed.length === 0) {
+          logEvent("github_import.lease_lost", { importId: payload.importId, userId: payload.userId });
+          throw new JobLeaseLostFailure("GitHub import job lease was lost");
+        }
         logEvent("github_import.failed", {
           importId: payload.importId,
           userId: payload.userId,

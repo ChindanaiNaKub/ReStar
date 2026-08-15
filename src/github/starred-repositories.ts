@@ -53,8 +53,7 @@ export async function fetchStarredPage(url: URL, accessToken: string, apiOrigin:
     const rateLimited = response.status === 429 || (
       response.status === 403 && (
         response.headers.has("retry-after") ||
-        response.headers.get("x-ratelimit-remaining") === "0" ||
-        response.headers.has("x-ratelimit-reset")
+        response.headers.get("x-ratelimit-remaining") === "0"
       )
     );
     if (rateLimited) {

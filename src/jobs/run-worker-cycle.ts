@@ -3,6 +3,8 @@ import { randomUUID } from "node:crypto";
 
 export type JobContext = {
   attempt: number;
+  jobId: number;
+  leaseToken: string;
   maxAttempts: number;
   heartbeat: () => Promise<boolean>;
 };
@@ -85,7 +87,13 @@ export async function runWorkerCycle({
           throw new Error(`No handler registered for job kind: ${job.kind}`);
         }
 
-        await handler(job.payload, { attempt: job.attempts, maxAttempts: job.max_attempts, heartbeat });
+        await handler(job.payload, {
+          attempt: job.attempts,
+          jobId: job.id,
+          leaseToken: job.locked_by,
+          maxAttempts: job.max_attempts,
+          heartbeat,
+        });
         const updated = await client<{ id: number }[]>`
           update jobs
           set status = 'completed', completed_at = ${now}, locked_at = null, locked_by = null
