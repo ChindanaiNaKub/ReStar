@@ -41,13 +41,15 @@ export async function runWorkerCycle({
 
   try {
     await enqueueDueDigests(client, now);
+    const claimCutoff = new Date();
     const claimed = await client.begin(async (transaction) => {
       return transaction<ClaimedJob[]>`
         with due_jobs as (
           select id
           from jobs
-          where (status = 'pending' and run_after <= ${now})
-             or (status = 'running' and locked_at <= ${new Date(now.getTime() - 5 * 60_000)})
+          where ((status = 'pending' and run_after <= ${now})
+             or (status = 'running' and locked_at <= ${new Date(now.getTime() - 5 * 60_000)}))
+            and created_at <= ${claimCutoff}
           order by run_after, id
           for update skip locked
           limit ${batchSize}
