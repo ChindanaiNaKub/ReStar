@@ -41,6 +41,7 @@ export default async function ImportPage() {
             </div>
           ) : null}
           {status?.error ? <p className="lede">{status.error}</p> : null}
+          {status?.status === "completed" ? <a className="primary-action" href="/rotation">Review Rotation</a> : null}
         </section>
       </main>
     );

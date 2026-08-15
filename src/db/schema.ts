@@ -112,6 +112,55 @@ export const starredRepositories = pgTable(
   (table) => [primaryKey({ columns: [table.userId, table.repositoryId] })],
 );
 
+export const rotationStates = pgTable(
+  "rotation_states",
+  {
+    userId: bigint("user_id", { mode: "number" })
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    repositoryId: bigint("repository_id", { mode: "number" })
+      .notNull()
+      .references(() => repositories.id, { onDelete: "cascade" }),
+    status: text("status").notNull().default("active"),
+    nextEligibleAt: timestamp("next_eligible_at", { withTimezone: true }).notNull(),
+    lastPresentedAt: timestamp("last_presented_at", { withTimezone: true }),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.userId, table.repositoryId] }),
+    index("rotation_states_eligible_idx").on(table.userId, table.status, table.nextEligibleAt),
+    check("rotation_states_status_check", sql`${table.status} in ('active', 'done', 'forgotten')`),
+  ],
+);
+
+export const rotationFeedbackEvents = pgTable(
+  "rotation_feedback_events",
+  {
+    id: bigserial("id", { mode: "number" }).primaryKey(),
+    userId: bigint("user_id", { mode: "number" })
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    repositoryId: bigint("repository_id", { mode: "number" })
+      .notNull()
+      .references(() => repositories.id, { onDelete: "cascade" }),
+    action: text("action").notNull(),
+    occurredAt: timestamp("occurred_at", { withTimezone: true }).notNull().defaultNow(),
+    nextEligibleAt: timestamp("next_eligible_at", { withTimezone: true }),
+    resultingStatus: text("resulting_status").notNull(),
+  },
+  (table) => [
+    index("rotation_feedback_events_repository_idx").on(table.userId, table.repositoryId, table.id),
+    check(
+      "rotation_feedback_events_action_check",
+      sql`${table.action} in ('still_interested', 'snooze', 'done', 'forget')`,
+    ),
+    check(
+      "rotation_feedback_events_status_check",
+      sql`${table.resultingStatus} in ('active', 'done', 'forgotten')`,
+    ),
+  ],
+);
+
 export const jobs = pgTable(
   "jobs",
   {
