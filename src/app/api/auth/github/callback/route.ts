@@ -52,14 +52,14 @@ export async function GET(request: Request) {
       const isFirstLogin = userId === undefined;
       if (userId === undefined) {
         const inserted = await transaction<{ id: number }[]>`
-          insert into users (github_user_id, github_login, avatar_url)
-          values (${String(identity.id)}, ${identity.login}, ${identity.avatar_url})
+          insert into users (github_user_id, github_login, email, avatar_url)
+          values (${String(identity.id)}, ${identity.login}, ${identity.email ?? null}, ${identity.avatar_url})
           returning id
         `;
         userId = inserted[0]!.id;
       } else {
         await transaction`
-          update users set github_login = ${identity.login}, avatar_url = ${identity.avatar_url}, updated_at = now()
+          update users set github_login = ${identity.login}, email = coalesce(${identity.email ?? null}, email), avatar_url = ${identity.avatar_url}, updated_at = now()
           where id = ${userId}
         `;
       }

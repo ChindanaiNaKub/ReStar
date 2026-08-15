@@ -2,11 +2,13 @@ import postgres from "postgres";
 import { randomUUID } from "node:crypto";
 
 import { decryptAccessToken } from "@/auth/crypto";
+import { claimDigestForDelivery, createDigest, markDigestFailed, markDigestSent, parseDigestDeliveryPayload, parseDigestPayload, renderDigestEmail } from "@/digest/service";
+import { createEmailProvider, EmailDeliveryFailure, type EmailProvider } from "@/email/provider";
 import { fetchStarredPage, GitHubImportFailure } from "@/github/starred-repositories";
 import { logEvent } from "@/observability/log";
 import type { JobContext } from "./run-worker-cycle";
 
-type ImportPayload = { importId: number; userId: number };
+type ImportPayload = { importId: number; userId: number; digestId?: number };
 
 class JobLeaseLostFailure extends Error {}
 
@@ -19,13 +21,18 @@ function importPayload(payload: unknown): ImportPayload {
   if (!Number.isSafeInteger(importId) || !Number.isSafeInteger(userId)) {
     throw new Error("Invalid GitHub Stars import payload");
   }
-  return { importId, userId };
+  const rawDigestId = (payload as { digestId?: unknown }).digestId;
+  if (rawDigestId === undefined) return { importId, userId };
+  const digestId = Number(rawDigestId);
+  if (!Number.isSafeInteger(digestId)) throw new Error("Invalid GitHub Stars import payload");
+  return { importId, userId, digestId };
 }
 
 type CreateJobHandlersOptions = {
   databaseUrl: string;
   githubApiBaseUrl?: string;
   tokenEncryptionKey?: string;
+  emailProvider?: EmailProvider;
 };
 
 export function createJobHandlers(options: CreateJobHandlersOptions) {
@@ -45,6 +52,13 @@ export function createJobHandlers(options: CreateJobHandlersOptions) {
         `;
         if (importState[0]?.status === "completed") {
           logEvent("github_import.already_completed", { importId: payload.importId, userId: payload.userId });
+          if (payload.digestId !== undefined) {
+            await client`
+              insert into jobs (kind, payload, idempotency_key, run_after)
+              values ('digest-delivery', ${client.json({ digestId: payload.digestId, userId: payload.userId })}, ${`digest-delivery:${payload.digestId}`}, now())
+              on conflict (idempotency_key) do nothing
+            `;
+          }
           return;
         }
         const credentials = await client<{ encrypted_access_token: string }[]>`
@@ -78,6 +92,13 @@ export function createJobHandlers(options: CreateJobHandlersOptions) {
           `;
           if (completed.length > 0) {
             logEvent("github_import.already_completed", { importId: payload.importId, userId: payload.userId });
+            if (payload.digestId !== undefined) {
+              await client`
+                insert into jobs (kind, payload, idempotency_key, run_after)
+                values ('digest-delivery', ${client.json({ digestId: payload.digestId, userId: payload.userId })}, ${`digest-delivery:${payload.digestId}`}, now())
+                on conflict (idempotency_key) do nothing
+              `;
+            }
             return;
           }
           throw new JobLeaseLostFailure("GitHub import job lease was lost");
@@ -184,6 +205,18 @@ export function createJobHandlers(options: CreateJobHandlersOptions) {
           userId: payload.userId,
           repositoriesRemovedFromRotation: completed.removed.length,
         });
+        if (payload.digestId !== undefined) {
+          await client`
+            insert into jobs (kind, payload, idempotency_key, run_after)
+            values (
+              'digest-delivery',
+              ${client.json({ digestId: payload.digestId, userId: payload.userId })},
+              ${`digest-delivery:${payload.digestId}`},
+              now()
+            )
+            on conflict (idempotency_key) do nothing
+          `;
+        }
       } catch (error) {
         if (error instanceof JobLeaseLostFailure || !(await context.heartbeat().catch(() => false))) {
           logEvent("github_import.lease_lost", { importId: payload.importId, userId: payload.userId });
@@ -212,6 +245,9 @@ export function createJobHandlers(options: CreateJobHandlersOptions) {
           logEvent("github_import.lease_lost", { importId: payload.importId, userId: payload.userId });
           throw new JobLeaseLostFailure("GitHub import job lease was lost");
         }
+        if (payload.digestId !== undefined) {
+          await markDigestFailed(client, payload.digestId, failure.message);
+        }
         logEvent("github_import.failed", {
           importId: payload.importId,
           userId: payload.userId,
@@ -219,6 +255,85 @@ export function createJobHandlers(options: CreateJobHandlersOptions) {
           retrying: willRetry,
         });
         throw failure;
+      } finally {
+        await client.end();
+      }
+    },
+    "digest-prepare": async (rawPayload: unknown, context: JobContext) => {
+      const payload = parseDigestPayload(rawPayload);
+      const client = postgres(options.databaseUrl, { max: 1 });
+      try {
+        if (!(await context.heartbeat())) throw new JobLeaseLostFailure("Digest preparation job lease was lost");
+        const digestId = await createDigest(client, payload);
+        const existing = await client<{ status: string }[]>`
+          select status from digests where id = ${digestId} and user_id = ${payload.userId}
+        `;
+        if (existing[0]?.status === "sent") return;
+
+        const syncJob = await client<{ id: number }[]>`
+          select id from jobs where idempotency_key = ${`digest-sync:${digestId}`}
+        `;
+        if (syncJob.length === 0) {
+          const imports = await client<{ id: number }[]>`
+            insert into imports (user_id, sync_type, status)
+            values (${payload.userId}, 'weekly', 'pending')
+            returning id
+          `;
+          await client`
+            insert into jobs (kind, payload, idempotency_key, run_after)
+            values (
+              'github-stars-import',
+              ${client.json({ importId: imports[0]!.id, userId: payload.userId, digestId })},
+              ${`digest-sync:${digestId}`},
+              now()
+            )
+            on conflict (idempotency_key) do nothing
+          `;
+        }
+      } finally {
+        await client.end();
+      }
+    },
+    "digest-delivery": async (rawPayload: unknown, context: JobContext) => {
+      const payload = parseDigestDeliveryPayload(rawPayload);
+      const client = postgres(options.databaseUrl, { max: 1 });
+      try {
+        let digest;
+        try {
+          digest = await claimDigestForDelivery(client, payload.digestId, payload.userId, new Date());
+        } catch (error) {
+          await markDigestFailed(client, payload.digestId, error instanceof Error ? error.message : "Digest delivery failed");
+          throw new EmailDeliveryFailure(error instanceof Error ? error.message : "Digest delivery failed", false);
+        }
+        if (!digest) return;
+        if (!(await context.heartbeat())) throw new JobLeaseLostFailure("Digest delivery job lease was lost");
+
+        try {
+          const provider = options.emailProvider ?? createEmailProvider();
+          const email = renderDigestEmail(digest);
+          await provider.send({
+            to: digest.email,
+            from: process.env.EMAIL_FROM ?? "ReStar <no-reply@localhost>",
+            subject: email.subject,
+            html: email.html,
+            text: email.text,
+            idempotencyKey: `digest:${digest.digestId}`,
+          });
+          if (!(await context.heartbeat())) throw new JobLeaseLostFailure("Digest delivery job lease was lost");
+          await markDigestSent(client, digest.digestId, new Date());
+          logEvent("digest.delivered", {
+            digestId: digest.digestId,
+            userId: digest.userId,
+            itemCount: digest.items.length,
+          });
+        } catch (error) {
+          if (error instanceof JobLeaseLostFailure) throw error;
+          const failure = error instanceof EmailDeliveryFailure
+            ? error
+            : new EmailDeliveryFailure(error instanceof Error ? error.message : "Email delivery failed", true);
+          await markDigestFailed(client, digest.digestId, failure.message);
+          throw failure;
+        }
       } finally {
         await client.end();
       }

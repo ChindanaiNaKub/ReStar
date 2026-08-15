@@ -1,4 +1,4 @@
-type GitHubIdentity = { id: number; login: string; avatar_url: string | null };
+type GitHubIdentity = { id: number; login: string; avatar_url: string | null; email?: string | null };
 
 function oauthBaseUrl() {
   return process.env.GITHUB_OAUTH_BASE_URL ?? "https://github.com";
@@ -50,5 +50,15 @@ export async function fetchGitHubIdentity(accessToken: string) {
   if (!response.ok) throw new Error("GitHub identity revalidation failed");
   const identity = (await response.json()) as GitHubIdentity;
   if (!identity.id || !identity.login) throw new Error("GitHub returned an invalid identity");
+  if (!identity.email) {
+    const emailsResponse = await fetch(new URL("/user/emails", apiBaseUrl()), {
+      headers: { accept: "application/vnd.github+json", authorization: `Bearer ${accessToken}` },
+    });
+    if (emailsResponse.ok) {
+      const emails = await emailsResponse.json() as Array<{ email?: string; primary?: boolean; verified?: boolean }>;
+      identity.email = emails.find((email) => email.primary && email.verified)?.email
+        ?? emails.find((email) => email.verified)?.email;
+    }
+  }
   return identity;
 }

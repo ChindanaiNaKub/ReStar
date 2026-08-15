@@ -50,6 +50,13 @@
       "when": 1786776779543,
       "tag": "0006_right_clint_barton",
       "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1786778000000,
+      "tag": "0007_weekly_digests",
+      "breakpoints": true
     }
   ]
 }

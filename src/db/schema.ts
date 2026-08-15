@@ -21,6 +21,7 @@ export const users = pgTable(
     id: bigserial("id", { mode: "number" }).primaryKey(),
     githubUserId: text("github_user_id").notNull(),
     githubLogin: text("github_login").notNull(),
+    email: text("email"),
     avatarUrl: text("avatar_url"),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
@@ -48,6 +49,58 @@ export const digestPreferences = pgTable(
     check("digest_preferences_hour_check", sql`${table.hour} between 0 and 23`),
     check("digest_preferences_minute_check", sql`${table.minute} between 0 and 59`),
     check("digest_preferences_item_count_check", sql`${table.itemCount} in (3, 4, 5)`),
+  ],
+);
+
+export const digests = pgTable(
+  "digests",
+  {
+    id: bigserial("id", { mode: "number" }).primaryKey(),
+    userId: bigint("user_id", { mode: "number" })
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    periodKey: text("period_key").notNull(),
+    scheduledFor: timestamp("scheduled_for", { withTimezone: true }).notNull(),
+    itemCount: smallint("item_count").notNull(),
+    status: text("status").notNull().default("pending"),
+    attempts: integer("attempts").notNull().default(0),
+    lastError: text("last_error"),
+    deliveredAt: timestamp("delivered_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    uniqueIndex("digests_user_period_idx").on(table.userId, table.periodKey),
+    index("digests_user_status_idx").on(table.userId, table.status),
+    check("digests_item_count_check", sql`${table.itemCount} in (3, 4, 5)`),
+    check("digests_status_check", sql`${table.status} in ('pending', 'sending', 'sent', 'failed')`),
+  ],
+);
+
+export const digestItems = pgTable(
+  "digest_items",
+  {
+    id: bigserial("id", { mode: "number" }).primaryKey(),
+    digestId: bigint("digest_id", { mode: "number" })
+      .notNull()
+      .references(() => digests.id, { onDelete: "cascade" }),
+    position: smallint("position").notNull(),
+    repositoryId: bigint("repository_id", { mode: "number" })
+      .notNull()
+      .references(() => repositories.id, { onDelete: "cascade" }),
+    ownerLogin: text("owner_login").notNull(),
+    name: text("name").notNull(),
+    fullName: text("full_name").notNull(),
+    description: text("description"),
+    language: text("language"),
+    starCount: integer("star_count").notNull(),
+    htmlUrl: text("html_url").notNull(),
+    starredAt: timestamp("starred_at", { withTimezone: true }).notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    uniqueIndex("digest_items_digest_position_idx").on(table.digestId, table.position),
+    uniqueIndex("digest_items_digest_repository_idx").on(table.digestId, table.repositoryId),
   ],
 );
 
@@ -103,7 +156,7 @@ export const imports = pgTable(
       "imports_status_check",
       sql`${table.status} in ('pending', 'running', 'retrying', 'completed', 'failed', 'failed_revoked', 'failed_rate_limit')`,
     ),
-    check("imports_sync_type_check", sql`${table.syncType} in ('initial', 'manual')`),
+    check("imports_sync_type_check", sql`${table.syncType} in ('initial', 'manual', 'weekly')`),
   ],
 );
 

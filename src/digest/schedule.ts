@@ -112,3 +112,39 @@ export function getNextDigestDelivery(schedule: DigestSchedule, now = new Date()
 
   return candidate.getTime() > now.getTime() ? candidate : new Date(candidate.getTime() + 7 * 24 * 60 * 60_000);
 }
+
+export function getMostRecentDigestDelivery(schedule: DigestSchedule, now = new Date()) {
+  if (schedule.paused) return null;
+
+  const localNow = getLocalDateTime(now, schedule.timezone);
+  const daysSinceDelivery = (localNow.weekday - schedule.dayOfWeek + 7) % 7;
+  const localDate = new Date(Date.UTC(
+    localNow.year,
+    localNow.month - 1,
+    localNow.day - daysSinceDelivery,
+  ));
+  let candidate = localDateTimeToUtc({
+    year: localDate.getUTCFullYear(),
+    month: localDate.getUTCMonth() + 1,
+    day: localDate.getUTCDate(),
+    weekday: schedule.dayOfWeek,
+    hour: schedule.hour,
+    minute: schedule.minute,
+    second: 0,
+  }, schedule.timezone);
+
+  if (candidate.getTime() > now.getTime()) {
+    const previousDate = new Date(localDate.getTime() - 7 * 24 * 60 * 60_000);
+    candidate = localDateTimeToUtc({
+      year: previousDate.getUTCFullYear(),
+      month: previousDate.getUTCMonth() + 1,
+      day: previousDate.getUTCDate(),
+      weekday: schedule.dayOfWeek,
+      hour: schedule.hour,
+      minute: schedule.minute,
+      second: 0,
+    }, schedule.timezone);
+  }
+
+  return candidate;
+}

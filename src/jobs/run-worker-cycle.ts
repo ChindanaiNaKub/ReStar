@@ -1,6 +1,8 @@
 import postgres from "postgres";
 import { randomUUID } from "node:crypto";
 
+import { enqueueDueDigests } from "@/digest/service";
+
 export type JobContext = {
   attempt: number;
   jobId: number;
@@ -38,6 +40,7 @@ export async function runWorkerCycle({
   const workerToken = randomUUID();
 
   try {
+    await enqueueDueDigests(client, now);
     const claimed = await client.begin(async (transaction) => {
       return transaction<ClaimedJob[]>`
         with due_jobs as (
