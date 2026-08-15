@@ -2,12 +2,14 @@ import { sql } from "drizzle-orm";
 import {
   bigint,
   bigserial,
+  boolean,
   check,
   index,
   integer,
   jsonb,
   pgTable,
   primaryKey,
+  smallint,
   text,
   timestamp,
   uniqueIndex,
@@ -24,6 +26,29 @@ export const users = pgTable(
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => [uniqueIndex("users_github_user_id_idx").on(table.githubUserId)],
+);
+
+export const digestPreferences = pgTable(
+  "digest_preferences",
+  {
+    userId: bigint("user_id", { mode: "number" })
+      .primaryKey()
+      .references(() => users.id, { onDelete: "cascade" }),
+    dayOfWeek: smallint("day_of_week").notNull().default(1),
+    hour: smallint("hour").notNull().default(9),
+    minute: smallint("minute").notNull().default(0),
+    timezone: text("timezone").notNull().default("UTC"),
+    itemCount: smallint("item_count").notNull().default(4),
+    paused: boolean("paused").notNull().default(false),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    check("digest_preferences_day_of_week_check", sql`${table.dayOfWeek} between 1 and 7`),
+    check("digest_preferences_hour_check", sql`${table.hour} between 0 and 23`),
+    check("digest_preferences_minute_check", sql`${table.minute} between 0 and 59`),
+    check("digest_preferences_item_count_check", sql`${table.itemCount} in (3, 4, 5)`),
+  ],
 );
 
 export const githubCredentials = pgTable("github_credentials", {
