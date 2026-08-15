@@ -2,7 +2,18 @@ import postgres from "postgres";
 import { randomUUID } from "node:crypto";
 
 import { decryptAccessToken } from "@/auth/crypto";
-import { claimDigestForDelivery, createDigest, markDigestFailed, markDigestSent, parseDigestDeliveryPayload, parseDigestPayload, renderDigestEmail } from "@/digest/service";
+import {
+  claimDigestForDelivery,
+  createDigest,
+  markDigestFailed,
+  markDigestSent,
+  parseDigestDeliveryPayload,
+  parseDigestPayload,
+  parsePauseNoticePayload,
+  renderDigestEmail,
+  renderPauseNoticeEmail,
+} from "@/digest/service";
+import { applicationUrl } from "@/email/actions";
 import { createEmailProvider, EmailDeliveryFailure, type EmailProvider } from "@/email/provider";
 import { fetchStarredPage, GitHubImportFailure } from "@/github/starred-repositories";
 import { logEvent } from "@/observability/log";
@@ -337,6 +348,53 @@ export function createJobHandlers(options: CreateJobHandlersOptions) {
             ? error
             : new EmailDeliveryFailure(error instanceof Error ? error.message : "Email delivery failed", true);
           await markDigestFailed(client, digest.digestId, failure.message);
+          throw failure;
+        }
+      } finally {
+        await client.end();
+      }
+    },
+    "digest-pause-notice": async (rawPayload: unknown, context: JobContext) => {
+      const payload = parsePauseNoticePayload(rawPayload);
+      const client = postgres(options.databaseUrl, { max: 1 });
+      try {
+        const users = await client<{ email: string | null; paused: boolean; pause_generation: number; pause_notice_sent_at: Date | null }[]>`
+          select users.email, digest_preferences.paused, digest_preferences.pause_generation,
+            digest_preferences.pause_notice_sent_at
+          from users
+          join digest_preferences on digest_preferences.user_id = users.id
+          where users.id = ${payload.userId}
+        `;
+        const user = users[0];
+        if (!user || !user.paused || user.pause_generation !== payload.pauseGeneration || user.pause_notice_sent_at) return;
+        if (!user.email) throw new EmailDeliveryFailure("User has no email address", false);
+        if (!(await context.heartbeat())) throw new JobLeaseLostFailure("Digest pause notice lease was lost");
+
+        try {
+          const provider = options.emailProvider ?? createEmailProvider();
+          const email = renderPauseNoticeEmail(applicationUrl("/settings", options.emailActionBaseUrl));
+          await provider.send({
+            to: user.email,
+            from: process.env.EMAIL_FROM ?? "ReStar <no-reply@localhost>",
+            subject: email.subject,
+            html: email.html,
+            text: email.text,
+            idempotencyKey: `pause-notice:${payload.userId}:${payload.pauseGeneration}`,
+          });
+          if (!(await context.heartbeat())) throw new JobLeaseLostFailure("Digest pause notice lease was lost");
+          await client`
+            update digest_preferences
+            set pause_notice_sent_at = now(), updated_at = now()
+            where user_id = ${payload.userId}
+              and paused = true
+              and pause_generation = ${payload.pauseGeneration}
+              and pause_notice_sent_at is null
+          `;
+        } catch (error) {
+          if (error instanceof JobLeaseLostFailure) throw error;
+          const failure = error instanceof EmailDeliveryFailure
+            ? error
+            : new EmailDeliveryFailure(error instanceof Error ? error.message : "Pause notice delivery failed", true);
           throw failure;
         }
       } finally {

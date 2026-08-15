@@ -110,6 +110,7 @@ export async function recordFeedbackInTransaction(
   repositoryId: number,
   action: FeedbackAction,
   now: Date,
+  digestItemId?: number,
 ) {
   const rows = await transaction<{
     status: RotationStatus | null;
@@ -176,6 +177,45 @@ export async function recordFeedbackInTransaction(
     on conflict (user_id, repository_id) do update set
       status = ${resultingStatus}, next_eligible_at = ${nextEligibleAt}, updated_at = now()
   `;
+  await transaction`
+    insert into digest_preferences (user_id)
+    values (${userId})
+    on conflict (user_id) do nothing
+  `;
+  await transaction`
+    update digest_preferences
+    set inactivity_count = 0, updated_at = now()
+    where user_id = ${userId}
+  `;
+  if (digestItemId !== undefined) {
+    await transaction`
+      update digests
+      set feedback_action_count = feedback_action_count + 1, updated_at = now()
+      where id = (
+        select digest_items.digest_id
+        from digest_items
+        join digests on digests.id = digest_items.digest_id
+        where digest_items.id = ${digestItemId}
+          and digests.user_id = ${userId}
+          and digests.status in ('sent', 'sending')
+      )
+    `;
+  } else {
+    await transaction`
+      update digests
+      set feedback_action_count = feedback_action_count + 1, updated_at = now()
+      where id = (
+        select digest_items.digest_id
+        from digest_items
+        join digests on digests.id = digest_items.digest_id
+        where digest_items.repository_id = ${repositoryId}
+          and digests.user_id = ${userId}
+          and digests.status in ('sent', 'sending')
+        order by digests.delivered_at desc nulls last, digests.id desc
+        limit 1
+      )
+    `;
+  }
 
   return {
     action,

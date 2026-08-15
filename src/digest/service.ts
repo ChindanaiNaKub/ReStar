@@ -1,11 +1,12 @@
 import type postgres from "postgres";
 
-import { emailActionUrl, ensureEmailActionToken, feedbackActionLabels } from "@/email/actions";
+import { applicationUrl, emailActionUrl, ensureEmailActionToken, feedbackActionLabels } from "@/email/actions";
 import { feedbackActions, type FeedbackAction } from "@/rotation/service";
 import { getMostRecentDigestDelivery } from "./schedule";
 
 const rotationEpoch = new Date(0);
 const minimumRepositoryAgeMs = 30 * 24 * 60 * 60_000;
+const inactivityPauseThreshold = 3;
 
 type DigestScheduleRow = {
   user_id: number;
@@ -37,7 +38,13 @@ export type ClaimedDigest = {
   email: string;
   periodKey: string;
   scheduledFor: Date;
+  pauseUrl: string;
   items: DigestEmailItem[];
+};
+
+export type PauseNoticePayload = {
+  userId: number;
+  pauseGeneration: number;
 };
 
 function escapeHtml(value: string) {
@@ -50,8 +57,9 @@ function escapeHtml(value: string) {
   })[character]!);
 }
 
-export function renderDigestEmail(digest: Pick<ClaimedDigest, "periodKey" | "items">) {
+export function renderDigestEmail(digest: Pick<ClaimedDigest, "periodKey" | "items"> & { pauseUrl?: string }) {
   const title = "Your weekly ReStar Digest";
+  const pauseUrl = digest.pauseUrl ?? applicationUrl("/settings");
   const itemText = digest.items.length === 0
     ? "No Eligible Repositories were available this week."
     : digest.items.map((item) => [
@@ -66,8 +74,17 @@ export function renderDigestEmail(digest: Pick<ClaimedDigest, "periodKey" | "ite
     : `<ol>${digest.items.map((item) => `<li><p><a href="${escapeHtml(item.htmlUrl)}"><strong>${escapeHtml(item.fullName)}</strong></a></p>${item.description ? `<p>${escapeHtml(item.description)}</p>` : ""}<p>${escapeHtml(item.language ?? "Unknown language")} · ${item.starCount.toLocaleString()} stars</p><p>${feedbackActions.map((action) => `<a href="${escapeHtml(item.actionLinks[action])}">${feedbackActionLabels[action]}</a>`).join(" · ")}</p></li>`).join("")}</ol>`;
   return {
     subject: `${title} · ${digest.items.length} ${digest.items.length === 1 ? "repository" : "repositories"}`,
-    text: `${title}\n\n${itemText}\n\nReview your Rotation at ReStar.`,
-    html: `<main><h1>${title}</h1>${htmlItems}<p>Review your Rotation at ReStar.</p></main>`,
+    text: `${title}\n\n${itemText}\n\nReview your Rotation at ReStar.\nPause future Digests: ${pauseUrl}`,
+    html: `<main><h1>${title}</h1>${htmlItems}<p>Review your Rotation at ReStar.</p><p><a href="${escapeHtml(pauseUrl)}">Pause future Digests</a></p></main>`,
+  };
+}
+
+export function renderPauseNoticeEmail(settingsUrl = applicationUrl("/settings")) {
+  const title = "Your ReStar Digests are paused";
+  return {
+    subject: title,
+    text: `${title}. ReStar paused scheduled delivery after three consecutive Digests without a Feedback Action. Resume delivery any time in settings: ${settingsUrl}`,
+    html: `<main><h1>${title}</h1><p>ReStar paused scheduled delivery after three consecutive Digests without a Feedback Action.</p><p><a href="${escapeHtml(settingsUrl)}">Resume delivery in settings</a></p></main>`,
   };
 }
 
@@ -155,6 +172,19 @@ export function parseDigestDeliveryPayload(payload: unknown) {
     throw new Error("Invalid Digest delivery payload");
   }
   return { digestId, userId };
+}
+
+export function parsePauseNoticePayload(payload: unknown): PauseNoticePayload {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    throw new Error("Invalid Digest pause notice payload");
+  }
+  const value = payload as Record<string, unknown>;
+  const userId = Number(value.userId);
+  const pauseGeneration = Number(value.pauseGeneration);
+  if (!Number.isSafeInteger(userId) || !Number.isSafeInteger(pauseGeneration) || pauseGeneration < 1) {
+    throw new Error("Invalid Digest pause notice payload");
+  }
+  return { userId, pauseGeneration };
 }
 
 export async function createDigest(client: ReturnType<typeof postgres>, payload: DigestPayload) {
@@ -304,6 +334,7 @@ export async function claimDigestForDelivery(
       email: digest.email,
       periodKey: digest.period_key,
       scheduledFor: digest.scheduled_for,
+      pauseUrl: applicationUrl("/settings", options.actionBaseUrl),
       items: items.map((item) => ({
         digestItemId: item.id,
         position: item.position,
@@ -321,10 +352,69 @@ export async function claimDigestForDelivery(
 }
 
 export async function markDigestSent(client: ReturnType<typeof postgres>, digestId: number, now: Date) {
-  await client`
-    update digests set status = 'sent', delivered_at = ${now}, last_error = null, updated_at = now()
-    where id = ${digestId} and status <> 'sent'
-  `;
+  return client.begin(async (transaction) => {
+    const digest = await transaction<{ user_id: number }[]>`
+      select user_id from digests where id = ${digestId}
+    `;
+    if (digest.length === 0) return { newlySent: false, paused: false };
+
+    await transaction`
+      insert into digest_preferences (user_id)
+      values (${digest[0]!.user_id})
+      on conflict (user_id) do nothing
+    `;
+    const preferences = await transaction<{
+      paused: boolean;
+      inactivity_count: number;
+      pause_generation: number;
+    }[]>`
+      select paused, inactivity_count, pause_generation
+      from digest_preferences
+      where user_id = ${digest[0]!.user_id}
+      for update
+    `;
+    const sent = await transaction<{ user_id: number; feedback_action_count: number }[]>`
+      update digests set status = 'sent', delivered_at = ${now}, last_error = null, updated_at = now()
+      where id = ${digestId} and status <> 'sent'
+      returning user_id, feedback_action_count
+    `;
+    if (sent.length === 0) return { newlySent: false, paused: false };
+    const current = preferences[0]!;
+    if (sent[0]!.feedback_action_count > 0) {
+      await transaction`
+        update digest_preferences
+        set inactivity_count = 0, updated_at = now()
+        where user_id = ${sent[0]!.user_id}
+      `;
+      return { newlySent: true, paused: current.paused };
+    }
+
+    const inactivityCount = current.inactivity_count + 1;
+    const shouldPause = !current.paused && inactivityCount >= inactivityPauseThreshold;
+    const pauseGeneration = shouldPause ? current.pause_generation + 1 : current.pause_generation;
+    await transaction`
+      update digest_preferences
+      set inactivity_count = ${inactivityCount},
+        paused = case when ${shouldPause} then true else paused end,
+        pause_generation = ${pauseGeneration},
+        pause_notice_sent_at = case when ${shouldPause} then null else pause_notice_sent_at end,
+        updated_at = now()
+      where user_id = ${sent[0]!.user_id}
+    `;
+    if (shouldPause) {
+      await transaction`
+        insert into jobs (kind, payload, idempotency_key, run_after)
+        values (
+          'digest-pause-notice',
+          ${transaction.json({ userId: sent[0]!.user_id, pauseGeneration })},
+          ${`digest-pause-notice:${sent[0]!.user_id}:${pauseGeneration}`},
+          ${now}
+        )
+        on conflict (idempotency_key) do nothing
+      `;
+    }
+    return { newlySent: true, paused: shouldPause };
+  });
 }
 
 export async function markDigestFailed(client: ReturnType<typeof postgres>, digestId: number, message: string) {

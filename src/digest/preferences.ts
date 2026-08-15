@@ -139,25 +139,35 @@ export async function updateDigestPreferences(
   now = new Date(),
 ) {
   const preferences = parseDigestPreferences(value);
-  const updated = await client<{
-    day_of_week: number;
-    hour: number;
-    minute: number;
-    timezone: string;
-    item_count: number;
-    paused: boolean;
-  }[]>`
-    insert into digest_preferences (user_id, day_of_week, hour, minute, timezone, item_count, paused)
-    values (${userId}, ${preferences.dayOfWeek}, ${preferences.hour}, ${preferences.minute}, ${preferences.timezone}, ${preferences.itemCount}, ${preferences.paused})
-    on conflict (user_id) do update set
-      day_of_week = excluded.day_of_week,
-      hour = excluded.hour,
-      minute = excluded.minute,
-      timezone = excluded.timezone,
-      item_count = excluded.item_count,
-      paused = excluded.paused,
-      updated_at = now()
-    returning day_of_week, hour, minute, timezone, item_count, paused
-  `;
-  return toView(toPreferences(updated[0]!), now);
+  return client.begin(async (transaction) => {
+    const updated = await transaction<{
+      day_of_week: number;
+      hour: number;
+      minute: number;
+      timezone: string;
+      item_count: number;
+      paused: boolean;
+    }[]>`
+      insert into digest_preferences (user_id, day_of_week, hour, minute, timezone, item_count, paused)
+      values (${userId}, ${preferences.dayOfWeek}, ${preferences.hour}, ${preferences.minute}, ${preferences.timezone}, ${preferences.itemCount}, ${preferences.paused})
+      on conflict (user_id) do update set
+        day_of_week = excluded.day_of_week,
+        hour = excluded.hour,
+        minute = excluded.minute,
+        timezone = excluded.timezone,
+        item_count = excluded.item_count,
+        paused = excluded.paused,
+        inactivity_count = case
+          when excluded.paused = false and digest_preferences.paused = true then 0
+          else digest_preferences.inactivity_count
+        end,
+        pause_notice_sent_at = case
+          when excluded.paused = false and digest_preferences.paused = true then null
+          else digest_preferences.pause_notice_sent_at
+        end,
+        updated_at = now()
+      returning day_of_week, hour, minute, timezone, item_count, paused
+    `;
+    return toView(toPreferences(updated[0]!), now);
+  });
 }

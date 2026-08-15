@@ -10,6 +10,7 @@ const day = 24 * 60 * 60 * 1000;
 let application: Awaited<ReturnType<typeof startTestApplication>>;
 let database: ReturnType<typeof postgres>;
 let sessionCookie: string;
+let userId: number;
 
 beforeAll(async () => {
   application = await startTestApplication();
@@ -19,6 +20,7 @@ beforeAll(async () => {
     values ('digest-user', 'digest-user')
     returning id
   `;
+  userId = user[0]!.id;
   const sessionToken = randomToken();
   await database`
     insert into sessions (token_hash, user_id, expires_at)
@@ -65,6 +67,11 @@ it("updates Digest preferences and can pause and resume scheduled Digests", asyn
     paused: true,
     nextDeliveryAt: null,
   });
+  await database`
+    update digest_preferences
+    set inactivity_count = 2, pause_notice_sent_at = now()
+    where user_id = ${userId}
+  `;
 
   const resumed = await application.request("/api/digest/preferences", {
     method: "PUT",
@@ -73,6 +80,10 @@ it("updates Digest preferences and can pause and resume scheduled Digests", asyn
   });
   expect(resumed.status).toBe(200);
   await expect(resumed.json()).resolves.toMatchObject({ paused: false, nextDeliveryAt: expect.any(String) });
+  const reset = await database<{ inactivity_count: number; pause_notice_sent_at: Date | null }[]>`
+    select inactivity_count, pause_notice_sent_at from digest_preferences where user_id = ${userId}
+  `;
+  expect(reset).toEqual([{ inactivity_count: 0, pause_notice_sent_at: null }]);
 });
 
 it("rejects invalid timezone and item-count input without changing stored settings", async () => {

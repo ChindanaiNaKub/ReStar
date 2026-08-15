@@ -71,6 +71,16 @@ function secretValue(secret?: string) {
   return value;
 }
 
+function configuredBaseUrl(baseUrl?: string) {
+  return baseUrl ?? process.env.APP_URL ?? (
+    process.env.APP_DOMAIN ? `https://${process.env.APP_DOMAIN}` : "http://localhost:3000"
+  );
+}
+
+export function applicationUrl(path: string, baseUrl?: string) {
+  return new URL(path, configuredBaseUrl(baseUrl)).toString();
+}
+
 export function getEmailActionTokenSecret(secret?: string) {
   return secretValue(secret);
 }
@@ -144,10 +154,7 @@ export function verifyEmailActionToken(token: string, secret?: string, now = new
 }
 
 export function emailActionUrl(token: string, baseUrl?: string) {
-  const configuredBaseUrl = baseUrl ?? process.env.APP_URL ?? (
-    process.env.APP_DOMAIN ? `https://${process.env.APP_DOMAIN}` : "http://localhost:3000"
-  );
-  const url = new URL("/email/action", configuredBaseUrl);
+  const url = new URL(applicationUrl("/email/action", baseUrl));
   url.searchParams.set("token", token);
   return url.toString();
 }
@@ -294,7 +301,7 @@ export async function applyEmailAction(
     `;
     if (otherEffective.length > 0) throw new EmailActionTokenError("already_applied");
 
-    const result = await recordFeedbackInTransaction(transaction, claims.userId, row.repository_id, claims.action, now);
+    const result = await recordFeedbackInTransaction(transaction, claims.userId, row.repository_id, claims.action, now, claims.digestItemId);
     await transaction`
       update email_action_tokens
       set used_at = ${now}, feedback_event_id = ${result.eventId},

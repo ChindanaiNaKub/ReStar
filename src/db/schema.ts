@@ -41,6 +41,9 @@ export const digestPreferences = pgTable(
     timezone: text("timezone").notNull().default("UTC"),
     itemCount: smallint("item_count").notNull().default(4),
     paused: boolean("paused").notNull().default(false),
+    inactivityCount: integer("inactivity_count").notNull().default(0),
+    pauseNoticeSentAt: timestamp("pause_notice_sent_at", { withTimezone: true }),
+    pauseGeneration: integer("pause_generation").notNull().default(0),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
@@ -49,6 +52,8 @@ export const digestPreferences = pgTable(
     check("digest_preferences_hour_check", sql`${table.hour} between 0 and 23`),
     check("digest_preferences_minute_check", sql`${table.minute} between 0 and 59`),
     check("digest_preferences_item_count_check", sql`${table.itemCount} in (3, 4, 5)`),
+    check("digest_preferences_inactivity_count_check", sql`${table.inactivityCount} >= 0`),
+    check("digest_preferences_pause_generation_check", sql`${table.pauseGeneration} >= 0`),
   ],
 );
 
@@ -64,6 +69,7 @@ export const digests = pgTable(
     itemCount: smallint("item_count").notNull(),
     status: text("status").notNull().default("pending"),
     attempts: integer("attempts").notNull().default(0),
+    feedbackActionCount: integer("feedback_action_count").notNull().default(0),
     lastError: text("last_error"),
     deliveredAt: timestamp("delivered_at", { withTimezone: true }),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
@@ -73,6 +79,7 @@ export const digests = pgTable(
     uniqueIndex("digests_user_period_idx").on(table.userId, table.periodKey),
     index("digests_user_status_idx").on(table.userId, table.status),
     check("digests_item_count_check", sql`${table.itemCount} in (3, 4, 5)`),
+    check("digests_feedback_action_count_check", sql`${table.feedbackActionCount} >= 0`),
     check("digests_status_check", sql`${table.status} in ('pending', 'sending', 'sent', 'failed')`),
   ],
 );
