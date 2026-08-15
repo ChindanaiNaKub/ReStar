@@ -62,6 +62,8 @@ export const imports = pgTable(
     userId: bigint("user_id", { mode: "number" })
       .notNull()
       .references(() => users.id, { onDelete: "cascade" }),
+    syncType: text("sync_type").notNull().default("initial"),
+    syncToken: text("sync_token"),
     status: text("status").notNull().default("pending"),
     pagesCompleted: integer("pages_completed").notNull().default(0),
     importedRepositories: integer("imported_repositories").notNull().default(0),
@@ -76,6 +78,7 @@ export const imports = pgTable(
       "imports_status_check",
       sql`${table.status} in ('pending', 'running', 'retrying', 'completed', 'failed', 'failed_revoked', 'failed_rate_limit')`,
     ),
+    check("imports_sync_type_check", sql`${table.syncType} in ('initial', 'manual')`),
   ],
 );
 
@@ -106,6 +109,7 @@ export const starredRepositories = pgTable(
       .notNull()
       .references(() => repositories.id, { onDelete: "cascade" }),
     starredAt: timestamp("starred_at", { withTimezone: true }).notNull(),
+    lastSeenSyncToken: text("last_seen_sync_token"),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },

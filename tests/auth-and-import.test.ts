@@ -135,6 +135,20 @@ async function authenticate(application: RunningApplication) {
   return { authorizationUrl, callback, sessionCookie };
 }
 
+async function runGitHubJob(application: RunningApplication, github: RunningGitHub) {
+  const { createJobHandlers } = await import("../src/jobs/handlers");
+  const { runWorkerCycle } = await import("../src/jobs/run-worker-cycle");
+  return runWorkerCycle({
+    databaseUrl: application.databaseUrl,
+    handlers: createJobHandlers({
+      databaseUrl: application.databaseUrl,
+      githubApiBaseUrl: github.baseUrl,
+      tokenEncryptionKey: encryptionKey,
+    }),
+    now: new Date(),
+  });
+}
+
 it("signs in with state and PKCE, revalidates identity, and queues initial import", async () => {
   const { application, authorizationUrl, callback, github, sessionCookie } = await startAuthenticatedApplication();
 
@@ -376,5 +390,202 @@ it("keeps completed-page progress visible when a later GitHub page needs retryin
     importedRepositories: 1,
     pagesCompleted: 1,
     status: "retrying",
+  });
+});
+
+it("reconciles complete pages, preserves partial runs, and reactivates a repository after it leaves Rotation", async () => {
+  const { application, github, sessionCookie } = await startAuthenticatedApplication({
+    stars: [[
+      {
+        starred_at: "2020-01-02T03:04:05Z",
+        repo: {
+          id: 2001, name: "alpha", full_name: "acme/alpha", private: false,
+          html_url: "https://github.com/acme/alpha", description: "Alpha", language: "TypeScript",
+          stargazers_count: 10, owner: { login: "acme" },
+        },
+      },
+      {
+        starred_at: "2020-02-02T03:04:05Z",
+        repo: {
+          id: 2002, name: "beta", full_name: "acme/beta", private: false,
+          html_url: "https://github.com/acme/beta", description: "Beta", language: "Rust",
+          stargazers_count: 20, owner: { login: "acme" },
+        },
+      },
+      {
+        starred_at: "2020-03-02T03:04:05Z",
+        repo: {
+          id: 2003, name: "gamma", full_name: "acme/gamma", private: false,
+          html_url: "https://github.com/acme/gamma", description: "Gamma", language: "Go",
+          stargazers_count: 30, owner: { login: "acme" },
+        },
+      },
+    ]],
+  });
+
+  await expect(runGitHubJob(application, github)).resolves.toMatchObject({ completed: 1 });
+  const rotation = await application.request("/api/rotation", { headers: { cookie: sessionCookie } });
+  const rotationBody = await rotation.json() as { repositories: Array<{ repositoryId: number; name: string }> };
+  const alpha = rotationBody.repositories.find((repository) => repository.name === "alpha");
+  const beta = rotationBody.repositories.find((repository) => repository.name === "beta");
+  if (!alpha || !beta) throw new Error("Expected alpha and beta in initial Rotation");
+  const feedback = await application.request("/api/rotation/feedback", {
+    method: "POST",
+    headers: { cookie: sessionCookie, "content-type": "application/json" },
+    body: JSON.stringify({ repositoryId: alpha.repositoryId, action: "done" }),
+  });
+  expect(feedback.status).toBe(200);
+  const betaFeedback = await application.request("/api/rotation/feedback", {
+    method: "POST",
+    headers: { cookie: sessionCookie, "content-type": "application/json" },
+    body: JSON.stringify({ repositoryId: beta.repositoryId, action: "done" }),
+  });
+  expect(betaFeedback.status).toBe(200);
+
+  github.requests.length = 0;
+  Object.assign(sharedGitHubOptions, {
+    stars: [[{
+      starred_at: "2020-02-02T03:04:05Z",
+      repo: {
+        id: 2002, name: "beta", full_name: "acme/beta", private: false,
+        html_url: "https://github.com/acme/beta", description: "Beta", language: "Rust",
+        stargazers_count: 20, owner: { login: "acme" },
+      },
+    }, {
+      starred_at: "2020-03-02T03:04:05Z",
+      repo: {
+        id: 2003, name: "gamma", full_name: "acme/gamma", private: false,
+        html_url: "https://github.com/acme/gamma", description: "Gamma", language: "Go",
+        stargazers_count: 30, owner: { login: "acme" },
+      },
+    }]],
+  });
+  const firstSync = await application.request("/api/sync", {
+    method: "POST",
+    headers: { cookie: sessionCookie },
+  });
+  expect(firstSync.status).toBe(202);
+  await expect(runGitHubJob(application, github)).resolves.toMatchObject({ completed: 1 });
+
+  const partialStars = await application.request("/api/starred-repositories", { headers: { cookie: sessionCookie } });
+  await expect(partialStars.json()).resolves.toMatchObject({
+    repositories: expect.arrayContaining([
+      expect.objectContaining({ fullName: "acme/beta" }),
+      expect.objectContaining({ fullName: "acme/gamma" }),
+    ]),
+  });
+  const history = postgres(application.databaseUrl);
+  const eventsAfterRemoval = await history<{ action: string; resulting_status: string }[]>`
+    select action, resulting_status from rotation_feedback_events
+    where repository_id = ${alpha.repositoryId} order by id
+  `;
+  expect(eventsAfterRemoval).toEqual([{ action: "done", resulting_status: "done" }]);
+  const betaState = await history<{ status: string }[]>`
+    select status from rotation_states where repository_id = ${beta.repositoryId}
+  `;
+  expect(betaState).toEqual([{ status: "done" }]);
+
+  await history`update imports set created_at = created_at - interval '1 hour' where sync_type = 'manual'`;
+  Object.assign(sharedGitHubOptions, {
+    stars: [[{
+      starred_at: "2020-01-02T03:04:05Z",
+      repo: {
+        id: 2001, name: "alpha", full_name: "acme/alpha", private: false,
+        html_url: "https://github.com/acme/alpha", description: "Alpha", language: "TypeScript",
+        stargazers_count: 11, owner: { login: "acme" },
+      },
+    }, {
+      starred_at: "2020-03-02T03:04:05Z",
+      repo: {
+        id: 2003, name: "gamma", full_name: "acme/gamma", private: false,
+        html_url: "https://github.com/acme/gamma", description: "Gamma", language: "Go",
+        stargazers_count: 30, owner: { login: "acme" },
+      },
+    }]],
+  });
+  const secondSync = await application.request("/api/sync", {
+    method: "POST",
+    headers: { cookie: sessionCookie },
+  });
+  expect(secondSync.status).toBe(202);
+  await expect(runGitHubJob(application, github)).resolves.toMatchObject({ completed: 1 });
+
+  const reactivated = await application.request("/api/rotation", { headers: { cookie: sessionCookie } });
+  await expect(reactivated.json()).resolves.toMatchObject({
+    repositories: expect.arrayContaining([expect.objectContaining({ name: "alpha" })]),
+  });
+  const state = await history<{ status: string }[]>`
+    select status from rotation_states where repository_id = ${alpha.repositoryId}
+  `;
+  expect(state).toEqual([{ status: "active" }]);
+  const historyAfterReactivation = await history<{ action: string; resulting_status: string }[]>`
+    select action, resulting_status from rotation_feedback_events
+    where repository_id = ${alpha.repositoryId} order by id
+  `;
+  expect(historyAfterReactivation).toEqual([{ action: "done", resulting_status: "done" }]);
+
+  await history`update imports set created_at = created_at - interval '1 hour' where sync_type = 'manual'`;
+  Object.assign(sharedGitHubOptions, {
+    stars: [[{
+      starred_at: "2020-01-02T03:04:05Z",
+      repo: {
+        id: 2001, name: "alpha", full_name: "acme/alpha", private: false,
+        html_url: "https://github.com/acme/alpha", description: "Alpha", language: "TypeScript",
+        stargazers_count: 11, owner: { login: "acme" },
+      },
+    }], []],
+    starsFailure: { status: 503, page: 2 },
+  });
+  const failedSync = await application.request("/api/sync", {
+    method: "POST",
+    headers: { cookie: sessionCookie },
+  });
+  expect(failedSync.status).toBe(202);
+  await expect(runGitHubJob(application, github)).resolves.toMatchObject({ retrying: 1 });
+  const safeAfterFailure = await application.request("/api/starred-repositories", { headers: { cookie: sessionCookie } });
+  await expect(safeAfterFailure.json()).resolves.toMatchObject({
+    repositories: expect.arrayContaining([
+      expect.objectContaining({ fullName: "acme/alpha" }),
+      expect.objectContaining({ fullName: "acme/gamma" }),
+    ]),
+  });
+  await history.end();
+});
+
+it("rate-limits Sync now and exposes revoked authorization", async () => {
+  const { application, github, sessionCookie } = await startAuthenticatedApplication({
+    stars: [[]],
+  });
+  await expect(runGitHubJob(application, github)).resolves.toMatchObject({ completed: 1 });
+  const staleJob = postgres(application.databaseUrl);
+  const latestJob = await staleJob<{ id: number }[]>`
+    select id from jobs where kind = 'github-stars-import' order by id desc limit 1
+  `;
+  await staleJob`
+    update jobs set status = 'running', locked_at = now() - interval '10 minutes', locked_by = 'stale-worker'
+    where id = ${latestJob[0]!.id}
+  `;
+  github.requests.length = 0;
+  await expect(runGitHubJob(application, github)).resolves.toMatchObject({ completed: 1 });
+  expect(github.requests.some((request) => request.url.startsWith("/user/starred"))).toBe(false);
+  await staleJob.end();
+  const first = await application.request("/api/sync", {
+    method: "POST",
+    headers: { cookie: sessionCookie },
+  });
+  expect(first.status).toBe(202);
+  const second = await application.request("/api/sync", {
+    method: "POST",
+    headers: { cookie: sessionCookie },
+  });
+  expect(second.status).toBe(429);
+  await expect(second.json()).resolves.toMatchObject({ status: "rate_limited" });
+
+  Object.assign(sharedGitHubOptions, { starsFailure: { status: 401 } });
+  await expect(runGitHubJob(application, github)).resolves.toMatchObject({ failed: 1 });
+  const status = await application.request("/api/sync", { headers: { cookie: sessionCookie } });
+  await expect(status.json()).resolves.toMatchObject({
+    status: "failed_revoked",
+    error: "GitHub access was revoked; sign in again",
   });
 });

@@ -1,4 +1,5 @@
 import postgres from "postgres";
+import { randomUUID } from "node:crypto";
 
 import { decryptAccessToken } from "@/auth/crypto";
 import { fetchStarredPage, GitHubImportFailure } from "@/github/starred-repositories";
@@ -39,6 +40,13 @@ export function createJobHandlers(options: CreateJobHandlersOptions) {
           userId: payload.userId,
           attempt: context.attempt,
         });
+        const importState = await client<{ status: string }[]>`
+          select status from imports where id = ${payload.importId} and user_id = ${payload.userId}
+        `;
+        if (importState[0]?.status === "completed") {
+          logEvent("github_import.already_completed", { importId: payload.importId, userId: payload.userId });
+          return;
+        }
         const credentials = await client<{ encrypted_access_token: string }[]>`
           select encrypted_access_token from github_credentials where user_id = ${payload.userId}
         `;
@@ -46,14 +54,16 @@ export function createJobHandlers(options: CreateJobHandlersOptions) {
         if (!encryptedToken) throw new GitHubImportFailure("GitHub access was revoked; sign in again", "revoked", false);
         const accessToken = decryptAccessToken(encryptedToken, options.tokenEncryptionKey);
         const apiBase = new URL(options.githubApiBaseUrl ?? process.env.GITHUB_API_BASE_URL ?? "https://api.github.com");
+        const syncToken = randomUUID();
         let pageUrl: URL | null = new URL("/user/starred?per_page=100&page=1", apiBase);
         let pagesCompleted = 0;
         let importedRepositories = 0;
 
         const started = await client<{ id: number }[]>`
-          update imports set status = 'running', error = null,
+          update imports set status = 'running', sync_token = ${syncToken}, error = null,
             pages_completed = 0, imported_repositories = 0, updated_at = now()
           where id = ${payload.importId} and user_id = ${payload.userId}
+            and status <> 'completed'
             and exists (
               select 1 from jobs
               where jobs.id = ${context.jobId} and jobs.status = 'running'
@@ -61,7 +71,17 @@ export function createJobHandlers(options: CreateJobHandlersOptions) {
             )
           returning id
         `;
-        if (started.length === 0) throw new JobLeaseLostFailure("GitHub import job lease was lost");
+        if (started.length === 0) {
+          const completed = await client<{ id: number }[]>`
+            select id from imports
+            where id = ${payload.importId} and user_id = ${payload.userId} and status = 'completed'
+          `;
+          if (completed.length > 0) {
+            logEvent("github_import.already_completed", { importId: payload.importId, userId: payload.userId });
+            return;
+          }
+          throw new JobLeaseLostFailure("GitHub import job lease was lost");
+        }
 
         while (pageUrl) {
           const page = await fetchStarredPage(pageUrl, accessToken, apiBase.origin);
@@ -93,13 +113,27 @@ export function createJobHandlers(options: CreateJobHandlersOptions) {
                   updated_at = now()
                 returning id
               `;
+              const existingStarred = await transaction<{ repository_id: number }[]>`
+                select repository_id from starred_repositories
+                where user_id = ${payload.userId} and repository_id = ${repositories[0]!.id}
+                for update
+              `;
               await transaction`
-                insert into starred_repositories (user_id, repository_id, starred_at)
-                values (${payload.userId}, ${repositories[0]!.id}, ${starredAt})
+                insert into starred_repositories (user_id, repository_id, starred_at, last_seen_sync_token)
+                values (${payload.userId}, ${repositories[0]!.id}, ${starredAt}, ${syncToken})
                 on conflict (user_id, repository_id) do update set
                   starred_at = excluded.starred_at,
+                  last_seen_sync_token = excluded.last_seen_sync_token,
                   updated_at = now()
               `;
+              if (existingStarred.length === 0) {
+                await transaction`
+                  insert into rotation_states (user_id, repository_id, status, next_eligible_at)
+                  values (${payload.userId}, ${repositories[0]!.id}, 'active', ${new Date(0)})
+                  on conflict (user_id, repository_id) do update set
+                    status = 'active', updated_at = now()
+                `;
+              }
             }
             const progressed = await transaction<{ id: number }[]>`
               update imports set
@@ -124,18 +158,32 @@ export function createJobHandlers(options: CreateJobHandlersOptions) {
         }
 
         if (!(await context.heartbeat())) throw new JobLeaseLostFailure("GitHub import job lease was lost");
-        const completed = await client<{ id: number }[]>`
-          update imports set status = 'completed', error = null, completed_at = now(), updated_at = now()
-          where id = ${payload.importId} and user_id = ${payload.userId}
-            and exists (
-              select 1 from jobs
-              where jobs.id = ${context.jobId} and jobs.status = 'running'
-                and jobs.locked_by = ${context.leaseToken}
-            )
-          returning id
-        `;
-        if (completed.length === 0) throw new JobLeaseLostFailure("GitHub import job lease was lost");
-        logEvent("github_import.completed", { importId: payload.importId, userId: payload.userId });
+        const completed = await client.begin(async (transaction) => {
+          const removed = await transaction<{ repository_id: number }[]>`
+            delete from starred_repositories
+            where user_id = ${payload.userId}
+              and last_seen_sync_token is distinct from ${syncToken}
+            returning repository_id
+          `;
+          const finished = await transaction<{ id: number }[]>`
+            update imports set status = 'completed', error = null, completed_at = now(), updated_at = now()
+            where id = ${payload.importId} and user_id = ${payload.userId}
+              and sync_token = ${syncToken}
+              and exists (
+                select 1 from jobs
+                where jobs.id = ${context.jobId} and jobs.status = 'running'
+                  and jobs.locked_by = ${context.leaseToken}
+              )
+            returning id
+          `;
+          if (finished.length === 0) throw new JobLeaseLostFailure("GitHub import job lease was lost");
+          return { finished, removed };
+        });
+        logEvent("github_import.completed", {
+          importId: payload.importId,
+          userId: payload.userId,
+          repositoriesRemovedFromRotation: completed.removed.length,
+        });
       } catch (error) {
         if (error instanceof JobLeaseLostFailure || !(await context.heartbeat().catch(() => false))) {
           logEvent("github_import.lease_lost", { importId: payload.importId, userId: payload.userId });

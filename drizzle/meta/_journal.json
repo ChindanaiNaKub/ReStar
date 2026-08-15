@@ -36,6 +36,13 @@
       "when": 1786773110111,
       "tag": "0004_rotation-feedback",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1786774000000,
+      "tag": "0005_star-sync",
+      "breakpoints": true
     }
   ]
 }
