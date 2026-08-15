@@ -15,6 +15,13 @@
       "when": 1786713536652,
       "tag": "0001_cynical_sumo",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1786770630121,
+      "tag": "0002_loud_punisher",
+      "breakpoints": true
     }
   ]
 }

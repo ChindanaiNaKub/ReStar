@@ -1,6 +1,7 @@
 import postgres from "postgres";
 
 import { decryptAccessToken } from "@/auth/crypto";
+import { logEvent } from "@/observability/log";
 import type { JobContext } from "./run-worker-cycle";
 
 type ImportPayload = { importId: number; userId: number };
@@ -55,7 +56,7 @@ async function fetchStarredPage(url: URL, accessToken: string, apiOrigin: string
     if (response.status === 401) {
       throw new GitHubImportFailure("GitHub access was revoked; sign in again", "revoked", false);
     }
-    if (response.status === 429 || (response.status === 403 && response.headers.get("x-ratelimit-remaining") === "0")) {
+    if (response.status === 429 || response.status === 403) {
       const retryAfterHeader = response.headers.get("retry-after");
       const retryAfterSeconds = retryAfterHeader === null ? Number.NaN : Number(retryAfterHeader);
       throw new GitHubImportFailure(
@@ -100,6 +101,11 @@ export function createJobHandlers(options: CreateJobHandlersOptions) {
       const payload = importPayload(rawPayload);
       const client = postgres(options.databaseUrl, { max: 1 });
       try {
+        logEvent("github_import.started", {
+          importId: payload.importId,
+          userId: payload.userId,
+          attempt: context.attempt,
+        });
         const credentials = await client<{ encrypted_access_token: string }[]>`
           select encrypted_access_token from github_credentials where user_id = ${payload.userId}
         `;
@@ -158,6 +164,10 @@ export function createJobHandlers(options: CreateJobHandlersOptions) {
               where id = ${payload.importId} and user_id = ${payload.userId}
             `;
           });
+          logEvent("github_import.page_completed", {
+            importId: payload.importId,
+            pageRepositories: publicStars.length,
+          });
           pageUrl = page.next;
         }
 
@@ -165,6 +175,7 @@ export function createJobHandlers(options: CreateJobHandlersOptions) {
           update imports set status = 'completed', error = null, completed_at = now(), updated_at = now()
           where id = ${payload.importId} and user_id = ${payload.userId}
         `;
+        logEvent("github_import.completed", { importId: payload.importId, userId: payload.userId });
       } catch (error) {
         const failure = error instanceof GitHubImportFailure
           ? error
@@ -179,6 +190,12 @@ export function createJobHandlers(options: CreateJobHandlersOptions) {
           update imports set status = ${willRetry ? "retrying" : finalStatus}, error = ${failure.message}, updated_at = now()
           where id = ${payload.importId} and user_id = ${payload.userId}
         `;
+        logEvent("github_import.failed", {
+          importId: payload.importId,
+          userId: payload.userId,
+          failureKind: failure.kind,
+          retrying: willRetry,
+        });
         throw failure;
       } finally {
         await client.end();

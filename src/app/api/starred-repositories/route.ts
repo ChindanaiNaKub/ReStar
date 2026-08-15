@@ -1,12 +1,8 @@
-import postgres from "postgres";
-
 import { getSessionUserId } from "@/auth/session";
+import { withDatabaseClient } from "@/db/with-client";
 
 export async function GET(request: Request) {
-  const databaseUrl = process.env.DATABASE_URL;
-  if (!databaseUrl) throw new Error("DATABASE_URL is required");
-  const client = postgres(databaseUrl, { max: 1 });
-  try {
+  return withDatabaseClient(async (client) => {
     const userId = await getSessionUserId(client, request);
     if (!userId) return Response.json({ error: "Unauthorized" }, { status: 401 });
     const rows = await client<{
@@ -37,7 +33,5 @@ export async function GET(request: Request) {
         starredAt: row.starred_at.toISOString(),
       })),
     });
-  } finally {
-    await client.end();
-  }
+  });
 }

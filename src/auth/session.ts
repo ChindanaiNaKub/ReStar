@@ -4,6 +4,13 @@ import { hashToken } from "./crypto";
 
 export const sessionCookieName = "restar_session";
 
+export function readRequestCookie(request: Request, name: string) {
+  return request.headers.get("cookie")
+    ?.split(";")
+    .map((part) => part.trim().split("="))
+    .find(([candidate]) => candidate === name)?.[1];
+}
+
 export async function getSessionUserIdFromToken(client: ReturnType<typeof postgres>, token: string | undefined) {
   if (!token) return null;
   const rows = await client<{ user_id: number }[]>`
@@ -15,9 +22,6 @@ export async function getSessionUserIdFromToken(client: ReturnType<typeof postgr
 }
 
 export async function getSessionUserId(client: ReturnType<typeof postgres>, request: Request) {
-  const token = request.headers.get("cookie")
-    ?.split(";")
-    .map((part) => part.trim().split("="))
-    .find(([name]) => name === sessionCookieName)?.[1];
+  const token = readRequestCookie(request, sessionCookieName);
   return getSessionUserIdFromToken(client, token);
 }

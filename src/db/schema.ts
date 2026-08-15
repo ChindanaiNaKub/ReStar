@@ -118,6 +118,7 @@ export const jobs = pgTable(
     id: bigserial("id", { mode: "number" }).primaryKey(),
     kind: text("kind").notNull(),
     payload: jsonb("payload").notNull().default({}),
+    idempotencyKey: text("idempotency_key"),
     status: text("status").notNull().default("pending"),
     runAfter: timestamp("run_after", { withTimezone: true }).notNull(),
     lockedAt: timestamp("locked_at", { withTimezone: true }),
@@ -129,6 +130,7 @@ export const jobs = pgTable(
   },
   (table) => [
     index("jobs_due_idx").on(table.status, table.runAfter),
+    uniqueIndex("jobs_idempotency_key_idx").on(table.idempotencyKey),
     check("jobs_status_check", sql`${table.status} in ('pending', 'running', 'completed', 'failed')`),
   ],
 );

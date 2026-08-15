@@ -2,17 +2,12 @@ import postgres from "postgres";
 import { NextResponse } from "next/server";
 
 import { encryptAccessToken, hashToken, randomToken } from "@/auth/crypto";
-import { sessionCookieName } from "@/auth/session";
+import { readRequestCookie, sessionCookieName } from "@/auth/session";
 import { exchangeAuthorizationCode, fetchGitHubIdentity } from "@/github/client";
+import { isTerminalImportStatus } from "@/imports/status-values";
+import { logEvent } from "@/observability/log";
 
 const oauthCookieName = "restar_oauth";
-
-function readCookie(request: Request, name: string) {
-  return request.headers.get("cookie")
-    ?.split(";")
-    .map((part) => part.trim().split("="))
-    .find(([candidate]) => candidate === name)?.[1];
-}
 
 export async function GET(request: Request) {
   const databaseUrl = process.env.DATABASE_URL;
@@ -21,8 +16,11 @@ export async function GET(request: Request) {
   const url = new URL(request.url);
   const state = url.searchParams.get("state");
   const code = url.searchParams.get("code");
-  const browserNonce = readCookie(request, oauthCookieName);
-  if (!state || !code || !browserNonce) return Response.json({ error: "Invalid OAuth callback" }, { status: 400 });
+  const browserNonce = readRequestCookie(request, oauthCookieName);
+  if (!state || !code || !browserNonce) {
+    logEvent("oauth.callback.rejected", { reason: "missing_parameters" });
+    return Response.json({ error: "Invalid OAuth callback" }, { status: 400 });
+  }
 
   const client = postgres(databaseUrl, { max: 1 });
   try {
@@ -33,6 +31,7 @@ export async function GET(request: Request) {
     `;
     const attempt = attempts[0];
     if (!attempt || attempt.browser_nonce_hash !== hashToken(browserNonce)) {
+      logEvent("oauth.callback.rejected", { reason: "invalid_state" });
       return Response.json({ error: "Invalid or expired OAuth state" }, { status: 400 });
     }
 
@@ -73,13 +72,35 @@ export async function GET(request: Request) {
         values (${hashToken(sessionToken)}, ${userId}, ${new Date(Date.now() + 30 * 24 * 60 * 60_000)})
       `;
 
-      if (isFirstLogin) {
-        const createdImports = await transaction<{ id: number }[]>`
-          insert into imports (user_id) values (${userId}) returning id
-        `;
+      const existingImports = await transaction<{ id: number; status: string }[]>`
+        select id, status from imports where user_id = ${userId} order by created_at desc limit 1
+      `;
+      let currentImport = existingImports[0];
+      const shouldQueueImport = isFirstLogin || !currentImport || isTerminalImportStatus(currentImport.status);
+      if (shouldQueueImport) {
+        if (!currentImport) {
+          const createdImports = await transaction<{ id: number; status: string }[]>`
+            insert into imports (user_id) values (${userId}) returning id, status
+          `;
+          currentImport = createdImports[0]!;
+        } else {
+          await transaction`
+            update imports set status = 'pending', pages_completed = 0, imported_repositories = 0,
+              error = null, completed_at = null, updated_at = now()
+            where id = ${currentImport.id}
+          `;
+        }
         await transaction`
-          insert into jobs (kind, payload, run_after)
-          values ('github-stars-import', ${transaction.json({ importId: createdImports[0]!.id, userId })}, now())
+          insert into jobs (kind, payload, idempotency_key, run_after)
+          values (
+            'github-stars-import',
+            ${transaction.json({ importId: currentImport.id, userId })},
+            ${`github-stars-import:${userId}`},
+            now()
+          )
+          on conflict (idempotency_key) do update set
+            payload = excluded.payload, status = 'pending', run_after = now(), locked_at = null,
+            attempts = 0, last_error = null, completed_at = null
         `;
       }
     });
@@ -93,6 +114,7 @@ export async function GET(request: Request) {
       secure: url.protocol === "https:",
     });
     response.cookies.set(oauthCookieName, "", { maxAge: 0, path: "/api/auth/github/callback" });
+    logEvent("oauth.callback.succeeded", { githubUserId: String(identity.id) });
     return response;
   } finally {
     await client.end();

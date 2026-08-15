@@ -9,7 +9,7 @@ const encryptionKey = Buffer.alloc(32, 7).toString("base64");
 
 type FakeGitHubOptions = {
   stars?: Array<Array<Record<string, unknown>>>;
-  starsFailure?: { status: number; headers?: Record<string, string> };
+  starsFailure?: { status: number; page?: number; headers?: Record<string, string> };
 };
 
 async function startFakeGitHub(options: FakeGitHubOptions = {}) {
@@ -37,14 +37,14 @@ async function startFakeGitHub(options: FakeGitHubOptions = {}) {
     }
 
     if (request.url?.startsWith("/user/starred")) {
-      if (options.starsFailure) {
+      const url = new URL(request.url, "http://github.test");
+      const page = Number(url.searchParams.get("page") ?? "1");
+      if (options.starsFailure && (options.starsFailure.page ?? 1) === page) {
         response.statusCode = options.starsFailure.status;
         for (const [name, value] of Object.entries(options.starsFailure.headers ?? {})) response.setHeader(name, value);
         response.end(JSON.stringify({ message: "GitHub failure" }));
         return;
       }
-      const url = new URL(request.url, "http://github.test");
-      const page = Number(url.searchParams.get("page") ?? "1");
       const stars = options.stars?.[page - 1] ?? [];
       response.setHeader("content-type", "application/json");
       if (options.stars && page < options.stars.length) {
@@ -97,6 +97,12 @@ async function startAuthenticatedApplication(options: FakeGitHubOptions = {}) {
   });
   applications.push(application);
 
+  const authentication = await authenticate(application);
+
+  return { application, github, ...authentication };
+}
+
+async function authenticate(application: RunningApplication) {
   const start = await application.request("/api/auth/github/start", { redirect: "manual" });
   const authorizationUrl = new URL(start.headers.get("location") ?? "");
   const oauthCookie = start.headers.get("set-cookie")?.split(";", 1)[0];
@@ -110,7 +116,7 @@ async function startAuthenticatedApplication(options: FakeGitHubOptions = {}) {
   const sessionCookie = callback.headers.get("set-cookie")?.match(/restar_session=[^;]+/)?.[0];
   if (!sessionCookie) throw new Error("OAuth callback did not create a session");
 
-  return { application, authorizationUrl, callback, github, sessionCookie };
+  return { authorizationUrl, callback, sessionCookie };
 }
 
 it("signs in with state and PKCE, revalidates identity, and queues initial import", async () => {
@@ -240,7 +246,7 @@ it("imports multiple pages of public Starred Repositories in the background", as
 
 it("shows rate-limit retry state without blocking the request", async () => {
   const { application, github, sessionCookie } = await startAuthenticatedApplication({
-    starsFailure: { status: 403, headers: { "x-ratelimit-remaining": "0", "retry-after": "60" } },
+    starsFailure: { status: 403, headers: { "retry-after": "60" } },
   });
   const { createJobHandlers } = await import("../src/jobs/handlers");
   const { runWorkerCycle } = await import("../src/jobs/run-worker-cycle");
@@ -284,5 +290,51 @@ it("shows revoked GitHub access as a terminal import failure", async () => {
   await expect(status.json()).resolves.toMatchObject({
     error: "GitHub access was revoked; sign in again",
     status: "failed_revoked",
+  });
+
+  const renewed = await authenticate(application);
+  const restarted = await application.request("/api/import/status", {
+    headers: { cookie: renewed.sessionCookie },
+  });
+  await expect(restarted.json()).resolves.toMatchObject({
+    attempts: 0,
+    error: null,
+    status: "pending",
+  });
+});
+
+it("keeps completed-page progress visible when a later GitHub page needs retrying", async () => {
+  const { application, github, sessionCookie } = await startAuthenticatedApplication({
+    stars: [
+      [{
+        starred_at: "2020-01-02T03:04:05Z",
+        repo: {
+          id: 1001, name: "alpha", full_name: "acme/alpha", private: false,
+          html_url: "https://github.com/acme/alpha", description: null, language: null,
+          stargazers_count: 123, owner: { login: "acme" },
+        },
+      }],
+      [],
+    ],
+    starsFailure: { status: 503, page: 2 },
+  });
+  const { createJobHandlers } = await import("../src/jobs/handlers");
+  const { runWorkerCycle } = await import("../src/jobs/run-worker-cycle");
+  const result = await runWorkerCycle({
+    databaseUrl: application.databaseUrl,
+    handlers: createJobHandlers({
+      databaseUrl: application.databaseUrl,
+      githubApiBaseUrl: github.baseUrl,
+      tokenEncryptionKey: encryptionKey,
+    }),
+    now: new Date(),
+  });
+  expect(result).toEqual({ claimed: 1, completed: 0, failed: 0, retrying: 1 });
+
+  const status = await application.request("/api/import/status", { headers: { cookie: sessionCookie } });
+  await expect(status.json()).resolves.toMatchObject({
+    importedRepositories: 1,
+    pagesCompleted: 1,
+    status: "retrying",
   });
 });

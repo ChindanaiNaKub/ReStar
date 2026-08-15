@@ -42,3 +42,30 @@ it("runs a due job through the scheduled worker entrypoint", async () => {
   expect(result).toEqual({ claimed: 1, completed: 1, failed: 0, retrying: 0 });
   expect(handledPayloads).toEqual([{ requestId: "job-123" }]);
 });
+
+it("reclaims a job after its worker lease expires", async () => {
+  const databaseUrl = postgresContainer.getConnectionUri();
+  const { migrateDatabase } = await import("../src/db/migrate");
+  await migrateDatabase(databaseUrl);
+
+  const seed = postgres(databaseUrl);
+  await seed`
+    insert into jobs (kind, payload, status, run_after, locked_at, attempts)
+    values (
+      'probe', ${seed.json({ requestId: "abandoned-job" })}, 'running',
+      ${new Date("2026-08-14T00:00:00Z")}, ${new Date("2026-08-14T00:01:00Z")}, 1
+    )
+  `;
+  await seed.end();
+
+  const { runWorkerCycle } = await import("../src/jobs/run-worker-cycle");
+  const handledPayloads: unknown[] = [];
+  const result = await runWorkerCycle({
+    databaseUrl,
+    now: new Date("2026-08-14T00:10:00Z"),
+    handlers: { probe: async (payload) => { handledPayloads.push(payload); } },
+  });
+
+  expect(result).toEqual({ claimed: 1, completed: 1, failed: 0, retrying: 0 });
+  expect(handledPayloads).toEqual([{ requestId: "abandoned-job" }]);
+});

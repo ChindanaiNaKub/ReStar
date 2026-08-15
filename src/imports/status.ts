@@ -1,7 +1,8 @@
 import type postgres from "postgres";
+import { isImportStatusName, type ImportStatusName } from "./status-values";
 
 export type ImportStatus = {
-  status: string;
+  status: ImportStatusName;
   pagesCompleted: number;
   importedRepositories: number;
   error: string | null;
@@ -26,6 +27,7 @@ export async function getCurrentImportStatus(client: ReturnType<typeof postgres>
   `;
   const current = rows[0];
   if (!current) return null;
+  if (!isImportStatusName(current.status)) throw new Error(`Unknown import status: ${current.status}`);
   return {
     status: current.status,
     pagesCompleted: current.pages_completed,

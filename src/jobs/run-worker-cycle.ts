@@ -34,7 +34,8 @@ export async function runWorkerCycle({
         with due_jobs as (
           select id
           from jobs
-          where status = 'pending' and run_after <= ${now}
+          where (status = 'pending' and run_after <= ${now})
+             or (status = 'running' and locked_at <= ${new Date(now.getTime() - 5 * 60_000)})
           order by run_after, id
           for update skip locked
           limit ${batchSize}
@@ -70,7 +71,8 @@ export async function runWorkerCycle({
         const message = error instanceof Error ? error.message : "Unknown job failure";
         const retryable = error as RetryableFailure;
         if (retryable.retryable && job.attempts < job.max_attempts) {
-          const delayMs = retryable.retryAfterMs ?? Math.min(60_000 * 2 ** (job.attempts - 1), 15 * 60_000);
+          const requestedDelay = retryable.retryAfterMs ?? 60_000 * 2 ** (job.attempts - 1);
+          const delayMs = Math.min(Math.max(requestedDelay, 1_000), 15 * 60_000);
           await client`
             update jobs
             set status = 'pending', last_error = ${message}, locked_at = null, run_after = ${new Date(now.getTime() + delayMs)}
