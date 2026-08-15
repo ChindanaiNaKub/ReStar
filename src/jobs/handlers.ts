@@ -32,6 +32,8 @@ type CreateJobHandlersOptions = {
   databaseUrl: string;
   githubApiBaseUrl?: string;
   tokenEncryptionKey?: string;
+  emailActionTokenSecret?: string;
+  emailActionBaseUrl?: string;
   emailProvider?: EmailProvider;
 };
 
@@ -300,7 +302,10 @@ export function createJobHandlers(options: CreateJobHandlersOptions) {
       try {
         let digest;
         try {
-          digest = await claimDigestForDelivery(client, payload.digestId, payload.userId, new Date());
+          digest = await claimDigestForDelivery(client, payload.digestId, payload.userId, new Date(), {
+            actionTokenSecret: options.emailActionTokenSecret ?? options.tokenEncryptionKey,
+            actionBaseUrl: options.emailActionBaseUrl,
+          });
         } catch (error) {
           await markDigestFailed(client, payload.digestId, error instanceof Error ? error.message : "Digest delivery failed");
           throw new EmailDeliveryFailure(error instanceof Error ? error.message : "Digest delivery failed", false);

@@ -104,6 +104,36 @@ export const digestItems = pgTable(
   ],
 );
 
+export const emailActionTokens = pgTable(
+  "email_action_tokens",
+  {
+    nonceHash: text("nonce_hash").primaryKey(),
+    nonce: text("nonce").notNull(),
+    userId: bigint("user_id", { mode: "number" })
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    digestItemId: bigint("digest_item_id", { mode: "number" })
+      .notNull()
+      .references(() => digestItems.id, { onDelete: "cascade" }),
+    intendedAction: text("intended_action").notNull(),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+    usedAt: timestamp("used_at", { withTimezone: true }),
+    feedbackEventId: bigint("feedback_event_id", { mode: "number" }),
+    previousStatus: text("previous_status"),
+    previousNextEligibleAt: timestamp("previous_next_eligible_at", { withTimezone: true }),
+    undoneAt: timestamp("undone_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    uniqueIndex("email_action_tokens_digest_action_idx").on(table.digestItemId, table.intendedAction),
+    index("email_action_tokens_digest_item_idx").on(table.digestItemId),
+    check(
+      "email_action_tokens_action_check",
+      sql`${table.intendedAction} in ('still_interested', 'snooze', 'done', 'forget')`,
+    ),
+  ],
+);
+
 export const githubCredentials = pgTable("github_credentials", {
   userId: bigint("user_id", { mode: "number" })
     .primaryKey()
@@ -229,12 +259,13 @@ export const rotationFeedbackEvents = pgTable(
     occurredAt: timestamp("occurred_at", { withTimezone: true }).notNull().defaultNow(),
     nextEligibleAt: timestamp("next_eligible_at", { withTimezone: true }),
     resultingStatus: text("resulting_status").notNull(),
+    compensatesEventId: bigint("compensates_event_id", { mode: "number" }),
   },
   (table) => [
     index("rotation_feedback_events_repository_idx").on(table.userId, table.repositoryId, table.id),
     check(
       "rotation_feedback_events_action_check",
-      sql`${table.action} in ('still_interested', 'snooze', 'done', 'forget')`,
+      sql`${table.action} in ('still_interested', 'snooze', 'done', 'forget', 'undo')`,
     ),
     check(
       "rotation_feedback_events_status_check",

@@ -8,7 +8,8 @@ Requirements: Node.js 22+, pnpm 11, Docker, and Docker Compose.
 
 ```sh
 cp .env.example .env
-# Fill in the GitHub OAuth credentials and generate GITHUB_TOKEN_ENCRYPTION_KEY.
+# Fill in the GitHub OAuth credentials, generate GITHUB_TOKEN_ENCRYPTION_KEY, and set
+# EMAIL_ACTION_TOKEN_SECRET to a separate random secret.
 pnpm install
 docker compose up --build
 ```

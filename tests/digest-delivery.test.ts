@@ -135,6 +135,12 @@ it("claims one due User, reconciles before selecting, and delivers one fixed Dig
   expect(emails[0]!.idempotencyKey).toBe(`digest:${digests[0]!.id}`);
   expect(emails[0]!.html).toContain("https://github.com/reStar/memory");
   expect(emails[0]!.text).toContain("A repository worth revisiting");
+  expect(emails[0]!.html).toContain("Still Interested");
+  expect(emails[0]!.html).toContain("Snooze");
+  expect(emails[0]!.html).toContain("Done");
+  expect(emails[0]!.html).toContain("Forget");
+  expect(emails[0]!.html).not.toContain("github-token");
+  expect(emails[0]!.html).not.toContain("digest-one@example.test");
 
   await runWorkerCycle({ databaseUrl: application.databaseUrl, now, handlers: jobHandlers });
   expect(emails).toHaveLength(1);

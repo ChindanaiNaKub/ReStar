@@ -26,6 +26,8 @@ export type RotationStatus = "active" | "done" | "forgotten";
 export class RotationRepositoryNotFound extends Error {}
 export class RotationRepositoryNotEligible extends Error {}
 
+type RotationQueryExecutor = postgres.Sql | postgres.TransactionSql;
+
 export function isFeedbackAction(value: unknown): value is FeedbackAction {
   return typeof value === "string" && feedbackActions.includes(value as FeedbackAction);
 }
@@ -102,6 +104,89 @@ export async function getEligibleRotation(
   });
 }
 
+export async function recordFeedbackInTransaction(
+  transaction: RotationQueryExecutor,
+  userId: number,
+  repositoryId: number,
+  action: FeedbackAction,
+  now: Date,
+) {
+  const rows = await transaction<{
+    status: RotationStatus | null;
+    next_eligible_at: Date | null;
+    starred_at: Date;
+    latest_action: FeedbackAction | null;
+  }[]>`
+    select rotation_states.status, rotation_states.next_eligible_at, starred_repositories.starred_at,
+      latest_feedback.action as latest_action
+    from starred_repositories
+    left join rotation_states on rotation_states.user_id = starred_repositories.user_id
+      and rotation_states.repository_id = starred_repositories.repository_id
+    left join lateral (
+      select action from rotation_feedback_events
+      where user_id = starred_repositories.user_id and repository_id = starred_repositories.repository_id
+      order by id desc limit 1
+    ) as latest_feedback on true
+    where starred_repositories.user_id = ${userId}
+      and starred_repositories.repository_id = ${repositoryId}
+    for update of starred_repositories
+  `;
+  const current = rows[0];
+  if (!current) throw new RotationRepositoryNotFound("Starred Repository is not in Rotation");
+
+  const previousStatus = current.status ?? "active";
+  const previousNextEligibleAt = current.next_eligible_at ?? rotationEpoch;
+  const terminal = previousStatus === "done" || previousStatus === "forgotten";
+  const terminalAction: FeedbackAction = previousStatus === "done" ? "done" : "forget";
+  if (terminal && action !== terminalAction) {
+    throw new RotationRepositoryNotEligible("Terminal Feedback Action cannot be changed");
+  }
+  const currentlyEligible = current.starred_at.getTime() <= now.getTime() - minimumRepositoryAgeMs
+    && previousNextEligibleAt.getTime() <= now.getTime();
+  const repeatedCooldown = previousStatus === "active"
+    && current.latest_action === action
+    && previousNextEligibleAt.getTime() > now.getTime();
+  if (!terminal && !currentlyEligible && !repeatedCooldown) {
+    throw new RotationRepositoryNotEligible("Starred Repository is not currently eligible");
+  }
+  const resultingStatus: RotationStatus = terminal
+    ? previousStatus
+    : action === "done"
+      ? "done"
+      : action === "forget"
+        ? "forgotten"
+        : "active";
+  const nextEligibleAt = repeatedCooldown
+    ? previousNextEligibleAt
+    : resultingStatus === "active"
+    ? new Date(now.getTime() + (action === "snooze" ? 30 : 90) * dayMs)
+    : rotationEpoch;
+  const eventNextEligibleAt = resultingStatus === "active" ? nextEligibleAt : null;
+
+  const events = await transaction<{ id: number }[]>`
+    insert into rotation_feedback_events (
+      user_id, repository_id, action, occurred_at, next_eligible_at, resulting_status
+    ) values (
+      ${userId}, ${repositoryId}, ${action}, ${now}, ${eventNextEligibleAt}, ${resultingStatus}
+    ) returning id
+  `;
+  await transaction`
+    insert into rotation_states (user_id, repository_id, status, next_eligible_at)
+    values (${userId}, ${repositoryId}, ${resultingStatus}, ${nextEligibleAt})
+    on conflict (user_id, repository_id) do update set
+      status = ${resultingStatus}, next_eligible_at = ${nextEligibleAt}, updated_at = now()
+  `;
+
+  return {
+    action,
+    status: resultingStatus,
+    nextEligibleAt: eventNextEligibleAt?.toISOString() ?? null,
+    eventId: events[0]!.id,
+    previousStatus,
+    previousNextEligibleAt,
+  };
+}
+
 export async function recordFeedback(
   client: ReturnType<typeof postgres>,
   userId: number,
@@ -109,76 +194,5 @@ export async function recordFeedback(
   action: FeedbackAction,
   now: Date,
 ) {
-  return client.begin(async (transaction) => {
-    const rows = await transaction<{
-      status: RotationStatus | null;
-      next_eligible_at: Date | null;
-      starred_at: Date;
-      latest_action: FeedbackAction | null;
-    }[]>`
-      select rotation_states.status, rotation_states.next_eligible_at, starred_repositories.starred_at,
-        latest_feedback.action as latest_action
-      from starred_repositories
-      left join rotation_states on rotation_states.user_id = starred_repositories.user_id
-        and rotation_states.repository_id = starred_repositories.repository_id
-      left join lateral (
-        select action from rotation_feedback_events
-        where user_id = starred_repositories.user_id and repository_id = starred_repositories.repository_id
-        order by id desc limit 1
-      ) as latest_feedback on true
-      where starred_repositories.user_id = ${userId}
-        and starred_repositories.repository_id = ${repositoryId}
-      for update of starred_repositories
-    `;
-    const current = rows[0];
-    if (!current) throw new RotationRepositoryNotFound("Starred Repository is not in Rotation");
-
-    const currentStatus = current.status ?? "active";
-    const terminal = currentStatus === "done" || currentStatus === "forgotten";
-    const terminalAction: FeedbackAction = currentStatus === "done" ? "done" : "forget";
-    if (terminal && action !== terminalAction) {
-      throw new RotationRepositoryNotEligible("Terminal Feedback Action cannot be changed");
-    }
-    const currentlyEligible = current.starred_at.getTime() <= now.getTime() - minimumRepositoryAgeMs
-      && (current.next_eligible_at ?? rotationEpoch).getTime() <= now.getTime();
-    const repeatedCooldown = currentStatus === "active"
-      && current.latest_action === action
-      && (current.next_eligible_at ?? rotationEpoch).getTime() > now.getTime();
-    if (!terminal && !currentlyEligible && !repeatedCooldown) {
-      throw new RotationRepositoryNotEligible("Starred Repository is not currently eligible");
-    }
-    const resultingStatus: RotationStatus = terminal
-      ? currentStatus
-      : action === "done"
-        ? "done"
-        : action === "forget"
-          ? "forgotten"
-          : "active";
-    const nextEligibleAt = repeatedCooldown
-      ? current.next_eligible_at!
-      : resultingStatus === "active"
-      ? new Date(now.getTime() + (action === "snooze" ? 30 : 90) * dayMs)
-      : rotationEpoch;
-    const eventNextEligibleAt = resultingStatus === "active" ? nextEligibleAt : null;
-
-    await transaction`
-      insert into rotation_feedback_events (
-        user_id, repository_id, action, occurred_at, next_eligible_at, resulting_status
-      ) values (
-        ${userId}, ${repositoryId}, ${action}, ${now}, ${eventNextEligibleAt}, ${resultingStatus}
-      )
-    `;
-    await transaction`
-      insert into rotation_states (user_id, repository_id, status, next_eligible_at)
-      values (${userId}, ${repositoryId}, ${resultingStatus}, ${nextEligibleAt})
-      on conflict (user_id, repository_id) do update set
-        status = ${resultingStatus}, next_eligible_at = ${nextEligibleAt}, updated_at = now()
-    `;
-
-    return {
-      action,
-      status: resultingStatus,
-      nextEligibleAt: eventNextEligibleAt?.toISOString() ?? null,
-    };
-  });
+  return client.begin((transaction) => recordFeedbackInTransaction(transaction, userId, repositoryId, action, now));
 }

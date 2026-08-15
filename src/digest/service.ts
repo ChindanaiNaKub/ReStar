@@ -1,5 +1,7 @@
 import type postgres from "postgres";
 
+import { emailActionUrl, ensureEmailActionToken, feedbackActionLabels } from "@/email/actions";
+import { feedbackActions, type FeedbackAction } from "@/rotation/service";
 import { getMostRecentDigestDelivery } from "./schedule";
 
 const rotationEpoch = new Date(0);
@@ -17,6 +19,7 @@ type DigestScheduleRow = {
 };
 
 export type DigestEmailItem = {
+  digestItemId: number;
   position: number;
   ownerLogin: string;
   name: string;
@@ -25,6 +28,7 @@ export type DigestEmailItem = {
   language: string | null;
   starCount: number;
   htmlUrl: string;
+  actionLinks: Record<FeedbackAction, string>;
 };
 
 export type ClaimedDigest = {
@@ -55,10 +59,11 @@ export function renderDigestEmail(digest: Pick<ClaimedDigest, "periodKey" | "ite
       item.description ? `  ${item.description}` : "",
       `  ${item.language ?? "Unknown language"} · ${item.starCount.toLocaleString()} stars`,
       `  ${item.htmlUrl}`,
+      `  Actions: ${feedbackActions.map((action) => `${feedbackActionLabels[action]}: ${item.actionLinks[action]}`).join(" | ")}`,
     ].filter(Boolean).join("\n")).join("\n\n");
   const htmlItems = digest.items.length === 0
     ? "<p>No Eligible Repositories were available this week.</p>"
-    : `<ol>${digest.items.map((item) => `<li><p><a href="${escapeHtml(item.htmlUrl)}"><strong>${escapeHtml(item.fullName)}</strong></a></p>${item.description ? `<p>${escapeHtml(item.description)}</p>` : ""}<p>${escapeHtml(item.language ?? "Unknown language")} · ${item.starCount.toLocaleString()} stars</p></li>`).join("")}</ol>`;
+    : `<ol>${digest.items.map((item) => `<li><p><a href="${escapeHtml(item.htmlUrl)}"><strong>${escapeHtml(item.fullName)}</strong></a></p>${item.description ? `<p>${escapeHtml(item.description)}</p>` : ""}<p>${escapeHtml(item.language ?? "Unknown language")} · ${item.starCount.toLocaleString()} stars</p><p>${feedbackActions.map((action) => `<a href="${escapeHtml(item.actionLinks[action])}">${feedbackActionLabels[action]}</a>`).join(" · ")}</p></li>`).join("")}</ol>`;
   return {
     subject: `${title} · ${digest.items.length} ${digest.items.length === 1 ? "repository" : "repositories"}`,
     text: `${title}\n\n${itemText}\n\nReview your Rotation at ReStar.`,
@@ -172,6 +177,7 @@ export async function claimDigestForDelivery(
   digestId: number,
   userId: number,
   now: Date,
+  options: { actionTokenSecret?: string; actionBaseUrl?: string } = {},
 ): Promise<ClaimedDigest | null> {
   return client.begin(async (transaction) => {
     const digests = await transaction<{
@@ -205,6 +211,7 @@ export async function claimDigestForDelivery(
     if (!digest.email) throw new Error("User has no email address");
 
     let items = await transaction<{
+      id: number;
       position: number;
       owner_login: string;
       name: string;
@@ -214,7 +221,7 @@ export async function claimDigestForDelivery(
       star_count: number;
       html_url: string;
     }[]>`
-      select position, owner_login, name, full_name, description, language, star_count, html_url
+      select id, position, owner_login, name, full_name, description, language, star_count, html_url
       from digest_items where digest_id = ${digest.id} order by position
     `;
 
@@ -268,9 +275,23 @@ export async function claimDigestForDelivery(
         `;
       }
       items = await transaction`
-        select position, owner_login, name, full_name, description, language, star_count, html_url
+        select id, position, owner_login, name, full_name, description, language, star_count, html_url
         from digest_items where digest_id = ${digest.id} order by position
       `;
+    }
+
+    const actionLinks = new Map<number, Record<FeedbackAction, string>>();
+    for (const item of items) {
+      const links = {} as Record<FeedbackAction, string>;
+      for (const action of feedbackActions) {
+        const token = await ensureEmailActionToken(transaction, {
+          userId: digest.user_id,
+          digestItemId: item.id,
+          action,
+        }, options.actionTokenSecret, now);
+        links[action] = emailActionUrl(token, options.actionBaseUrl);
+      }
+      actionLinks.set(item.id, links);
     }
 
     await transaction`
@@ -284,6 +305,7 @@ export async function claimDigestForDelivery(
       periodKey: digest.period_key,
       scheduledFor: digest.scheduled_for,
       items: items.map((item) => ({
+        digestItemId: item.id,
         position: item.position,
         ownerLogin: item.owner_login,
         name: item.name,
@@ -292,6 +314,7 @@ export async function claimDigestForDelivery(
         language: item.language,
         starCount: item.star_count,
         htmlUrl: item.html_url,
+        actionLinks: actionLinks.get(item.id)!,
       })),
     };
   });
